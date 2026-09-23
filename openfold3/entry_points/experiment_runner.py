@@ -162,9 +162,13 @@ class ExperimentRunner(ABC):
             model_update = _model_update_with_mps_preset(model_update)
         return self.project_entry.get_model_config_with_update(model_update)
 
+    def _seed_before_init(self) -> None:
+        """Hook to seed the RNGs weight init draws from. No-op by default."""
+
     @cached_property
     def lightning_module(self) -> pl.LightningModule:
         """Instantiate and return the model."""
+        self._seed_before_init()
         return self.project_entry.runner(self.model_config, log_dir=self.log_dir)
 
     @cached_property
@@ -397,6 +401,15 @@ class TrainingExperimentRunner(ExperimentRunner):
         self.checkpoint_config = experiment_config.checkpoint_config
 
         self.update_trainer_config()
+
+    def _seed_before_init(self) -> None:
+        """Seed so weight init is reproducible.
+
+        RankSpecificSeedCallback only fires inside trainer.fit(), by which point
+        the model is already built, so seeding it there is too late. Rank-independent
+        on purpose: every rank must start from the same weights.
+        """
+        pl.seed_everything(self.seed, workers=False)
 
     def setup(self) -> None:
         """Set up the experiment environment.

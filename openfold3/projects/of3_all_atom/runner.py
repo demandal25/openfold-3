@@ -634,8 +634,15 @@ class OpenFold3AllAtom(ModelRunner):
         # Only rank zero will actually log the gradients
         log_grad_metrics = self.trainer.is_global_zero and self.logger is not None
 
-        # Only log 4 representative blocks to reduce overhead
-        block_idxs = [0, 16, 32, 47]
+        # Only log 4 representative blocks to reduce overhead. Derived from the
+        # actual depth rather than hardcoded: this yields [0, 16, 32, 47] at the
+        # default 48 blocks, and stays in range for any other no_blocks.
+        n_blocks = len(self.model.pairformer_stack.blocks)
+        block_idxs = (
+            sorted({0, n_blocks // 3, 2 * n_blocks // 3, n_blocks - 1})
+            if n_blocks
+            else []
+        )
 
         # To see if this slows down training, we additionally log runtimes from the
         # global_zero process

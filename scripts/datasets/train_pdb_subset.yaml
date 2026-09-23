@@ -29,7 +29,7 @@ model_update:
           msa_module:
             swiglu_seq_chunk_size: 1024
           use_cueq_triangle_kernels: false
-          use_deepspeed_evo_attention: true
+          use_deepspeed_evo_attention: false
     architecture:
       shared:
         use_confidence_emb_prob: 0.8

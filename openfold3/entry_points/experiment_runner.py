@@ -32,7 +32,7 @@ from lightning_fabric.utilities.rank_zero import _get_rank
 from pydantic import BaseModel
 from pytorch_lightning.callbacks.lr_monitor import LearningRateMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning.profilers import PyTorchProfiler
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
@@ -593,11 +593,15 @@ class TrainingExperimentRunner(ExperimentRunner):
 
     @cached_property
     def loggers(self):
-        """Retrieve the list of loggers to be used in the experiment."""
-        _loggers = []
+        """Retrieve the list of loggers to be used in the experiment.
+
+        Falls back to a CSV logger when W&B is not configured: every metric site
+        is guarded on `self.logger is not None`, so with an empty list a run
+        silently records nothing -- including the per-step gradient metrics.
+        """
         if self.use_wandb:
-            _loggers.append(self.wandb.logger)
-        return _loggers
+            return [self.wandb.logger]
+        return [CSVLogger(save_dir=self.log_dir, name="", version="")]
 
     @cached_property
     def callbacks(self):

@@ -20,6 +20,8 @@ from functools import partialmethod
 import torch
 import torch.nn as nn
 
+from openfold3.core.utils import vendor_rng
+
 
 class Dropout(nn.Module):
     """
@@ -43,7 +45,6 @@ class Dropout(nn.Module):
         if isinstance(batch_dim, int):
             batch_dim = [batch_dim]
         self.batch_dim = batch_dim
-        self.dropout = nn.Dropout(self.r)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -60,8 +61,7 @@ class Dropout(nn.Module):
         if self.batch_dim is not None:
             for bd in self.batch_dim:
                 shape[bd] = 1
-        mask = x.new_ones(shape)
-        mask = self.dropout(mask)
+        mask = vendor_rng.dropout_mask(shape, self.r, device=x.device, dtype=x.dtype)
         x = x * mask
         return x
 

@@ -1,0 +1,217 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for :mod:`openfold3.core.utils.parity_probe`.
+
+Driven through a real ``pl.Trainer`` in **manual optimization**, because that is
+what OF3 uses (per-sample gradient clipping forces it) and it is the mode in
+which ``on_before_optimizer_step`` firing is not obvious.
+"""
+
+import json
+
+import pytest
+import pytorch_lightning as pl
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from openfold3.core.utils.parity_probe import (
+    DEFAULT_MODULE_PATTERNS,
+    NonFiniteValue,
+    ParityProbeCallback,
+)
+
+
+class _ManualModule(pl.LightningModule):
+    """Minimal stand-in for OF3's manual-optimization training step."""
+
+    def __init__(self, blow_up_at: int | None = None):
+        super().__init__()
+        self.automatic_optimization = False
+        self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+        self.blow_up_at = blow_up_at
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x).tanh()
+        return x
+
+    def training_step(self, batch, batch_idx):
+        (inputs,) = batch
+        opt = self.optimizers()
+        opt.zero_grad()
+        if self.blow_up_at is not None and self.global_step == self.blow_up_at:
+            with torch.no_grad():
+                self.blocks[1].weight.fill_(float("inf"))
+        loss = self(inputs).pow(2).sum()
+        self.manual_backward(loss)
+        opt.step()
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=1e-3)
+
+
+def _run(tmp_path, *, steps=4, blow_up_at=None, **probe_kwargs):
+    probe = ParityProbeCallback(
+        output_dir=tmp_path, module_patterns=(r"blocks\.\d+$",), **probe_kwargs
+    )
+    data = DataLoader(TensorDataset(torch.randn(steps * 2, 4)), batch_size=2)
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        callbacks=[probe],
+    )
+    trainer.fit(_ManualModule(blow_up_at=blow_up_at), data)
+    return probe
+
+
+def _rows(tmp_path):
+    path = tmp_path / "trajectory_rank0.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _by_kind(rows, kind):
+    return [r for r in rows if r["kind"] == kind]
+
+
+# ---------------------------------------------------------------------------
+# It records at all, under manual optimization
+# ---------------------------------------------------------------------------
+
+
+def test_records_activations_losses_and_gradients(tmp_path):
+    torch.manual_seed(0)
+    _run(tmp_path)
+    rows = _rows(tmp_path)
+
+    assert _by_kind(rows, "activation"), "no activation rows"
+    assert _by_kind(rows, "loss"), "no loss rows"
+    assert _by_kind(rows, "grad_summary"), (
+        "on_before_optimizer_step did not fire under manual optimization"
+    )
+    assert {"blocks.0", "blocks.1", "blocks.2"} == {
+        r["module"] for r in _by_kind(rows, "activation")
+    }
+
+
+def test_grad_summary_is_emitted_once_per_optimizer_step(tmp_path):
+    torch.manual_seed(0)
+    _run(tmp_path, steps=4)
+    summaries = _by_kind(_rows(tmp_path), "grad_summary")
+    assert len(summaries) == 4
+    assert [s["step"] for s in summaries] == [0, 1, 2, 3]
+    assert all(s["total_norm"] > 0 for s in summaries)
+    assert all(s["clipped"] is True for s in summaries)
+
+
+def test_ordinals_are_dense_and_restart_each_step(tmp_path):
+    torch.manual_seed(0)
+    _run(tmp_path)
+    per_step = {}
+    for row in _by_kind(_rows(tmp_path), "activation"):
+        per_step.setdefault((row["step"], row["module"]), []).append(row["ordinal"])
+    assert per_step
+    for key, ordinals in per_step.items():
+        assert ordinals == list(range(len(ordinals))), key
+
+
+# ---------------------------------------------------------------------------
+# every_n_steps
+# ---------------------------------------------------------------------------
+
+
+def test_every_n_steps_thins_detail_but_not_the_summary(tmp_path):
+    torch.manual_seed(0)
+    _run(tmp_path, steps=4, every_n_steps=2)
+    rows = _rows(tmp_path)
+    assert {r["step"] for r in _by_kind(rows, "activation")} == {0, 2}
+    # The cheap summary and batch identity must survive the thinning, or a spike
+    # between probe steps is invisible.
+    assert {r["step"] for r in _by_kind(rows, "grad_summary")} == {0, 1, 2, 3}
+
+
+def test_rejects_non_positive_every_n_steps(tmp_path):
+    with pytest.raises(ValueError, match="every_n_steps"):
+        ParityProbeCallback(output_dir=tmp_path, every_n_steps=0)
+
+
+# ---------------------------------------------------------------------------
+# The tripwire
+# ---------------------------------------------------------------------------
+
+
+def test_aborts_on_non_finite_activation(tmp_path):
+    torch.manual_seed(0)
+    with pytest.raises(NonFiniteValue, match="non-finite"):
+        _run(tmp_path, steps=4, blow_up_at=2)
+    rows = _rows(tmp_path)
+    bad = [r for r in rows if r.get("nonfinite", 0)]
+    assert bad, "tripwire fired but nothing was recorded"
+    assert bad[0]["step"] == 2, f"blamed the wrong step: {bad[0]}"
+    assert bad[0]["module"] == "blocks.1", f"blamed the wrong module: {bad[0]}"
+
+
+def test_can_be_told_not_to_abort(tmp_path):
+    """The run continues and the non-finite value is still on the record."""
+    torch.manual_seed(0)
+    _run(tmp_path, steps=4, blow_up_at=2, abort_on_nonfinite=False)
+    rows = _rows(tmp_path)
+    assert any(r.get("nonfinite", 0) for r in rows)
+    assert max(r["step"] for r in _by_kind(rows, "grad_summary")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_hooks_are_removed_on_teardown(tmp_path):
+    torch.manual_seed(0)
+    probe = _run(tmp_path)
+    assert probe._handles == []
+    assert probe._file is None
+
+
+def test_unmatched_patterns_warn_but_still_record_gradients(tmp_path, caplog):
+    torch.manual_seed(0)
+    probe = ParityProbeCallback(output_dir=tmp_path, module_patterns=(r"nope$",))
+    data = DataLoader(TensorDataset(torch.randn(4, 4)), batch_size=2)
+    pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        callbacks=[probe],
+    ).fit(_ManualModule(), data)
+    rows = _rows(tmp_path)
+    assert not _by_kind(rows, "activation")
+    assert _by_kind(rows, "grad_summary")
+    assert any("no module matched" in r.message for r in caplog.records)
+
+
+def test_default_patterns_are_valid_regexes():
+    import re
+
+    for pattern in DEFAULT_MODULE_PATTERNS:
+        re.compile(pattern)

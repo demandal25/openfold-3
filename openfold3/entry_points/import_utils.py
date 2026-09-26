@@ -34,10 +34,17 @@ def _enable_tf32():
 
 
 def _configure_torch_backend():
-    """Apply backend settings"""
+    """Apply backend settings.
+
+    ``OF3_BLAS_LIBRARY`` overrides the ROCm BLAS choice, for attributing a
+    numerical difference to the GEMM backend. Unset keeps the default.
+    """
+    import os
+
     import torch
 
     # Force the cuBLAS backend on AMD/ROCm to match the numerics of
     # NVIDIA-trained models.
     if torch.cuda.is_available() and torch.version.hip is not None:
-        torch.backends.cuda.preferred_blas_library("cublas")
+        library = os.environ.get("OF3_BLAS_LIBRARY", "cublas")
+        torch.backends.cuda.preferred_blas_library(library)

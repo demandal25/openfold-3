@@ -133,6 +133,7 @@ record = {
         "sha256": hashlib.sha256(open(yaml_path, "rb").read()).hexdigest(),
     },
     "vendor": "amd" if is_rocm else "nvidia",
+    "blas_backend": str(torch.backends.cuda.preferred_blas_library()),
     "torch": {
         "version": torch.__version__,
         "hip": torch.version.hip,
@@ -141,7 +142,8 @@ record = {
         "device_count": torch.cuda.device_count(),
     },
     "env": {k: os.environ.get(k) for k in (
-        "OF3_VENDOR_INDEPENDENT_RNG", "PYTHONHASHSEED", "CUBLAS_WORKSPACE_CONFIG",
+        "OF3_VENDOR_INDEPENDENT_RNG", "OF3_BLAS_LIBRARY", "PYTHONHASHSEED",
+        "CUBLAS_WORKSPACE_CONFIG",
         "MIOPEN_FIND_MODE", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
         "TORCH_ROCM_FA_PREFER_CK", "OF3_TRITON_EXP2", "OF3_TRITON_DYNAMIC_SHAPES",
         "NCCL_ALGO", "NCCL_PROTO", "RCCL_ALGO",

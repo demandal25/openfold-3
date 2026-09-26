@@ -54,6 +54,7 @@ from openfold3.core.utils.checkpoint_loading_utils import (
     get_state_dict_from_checkpoint,
     load_checkpoint,
 )
+from openfold3.core.utils.parity_probe import ParityProbeCallback
 from openfold3.core.utils.precision_utils import OF3DeepSpeedPrecision
 from openfold3.core.utils.script_utils import set_ulimits
 from openfold3.entry_points.validator import (
@@ -616,6 +617,16 @@ class TrainingExperimentRunner(ExperimentRunner):
 
         if self.model_config.settings.debug.log_iteration_time:
             _callbacks.append(PredictTimer(output_dir=None))
+
+        _parity = self.model_config.settings.get("parity_probe")
+        if _parity is not None and _parity.enabled:
+            _callbacks.append(
+                ParityProbeCallback(
+                    output_dir=self.log_dir / "parity",
+                    every_n_steps=_parity.every_n_steps,
+                    abort_on_nonfinite=_parity.abort_on_nonfinite,
+                )
+            )
 
         _log_lr = self.logging_config.log_lr
         if _log_lr and self.use_wandb:

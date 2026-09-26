@@ -168,6 +168,14 @@ model_config = mlc.ConfigDict(
                 "profile_grad_logging": False,
                 "log_iteration_time": False,
             },
+            # Per-step trajectory records for cross-vendor comparison; see
+            # openfold3/core/utils/parity_probe.py. Off by default: the probe
+            # costs a host sync per watched module per firing.
+            "parity_probe": {
+                "enabled": False,
+                "every_n_steps": 1,
+                "abort_on_nonfinite": True,
+            },
         },
         "architecture": {
             "shared": {

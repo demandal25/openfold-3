@@ -27,12 +27,13 @@ processes free of those imports, avoiding leaked-semaphore warnings at shutdown
 
 import torch
 
+from openfold3.core.utils import vendor_rng
 from openfold3.core.utils.rigid_utils import quat_to_rot
 
 
 def sample_rotations(shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """Sample random quaternions"""
-    q = torch.randn(*shape, 4, dtype=dtype, device=device)
+    q = vendor_rng.randn(*shape, 4, dtype=dtype, device=device)
     q = q / torch.linalg.norm(q, dim=-1, keepdim=True)
 
     rots = quat_to_rot(q)
@@ -58,7 +59,7 @@ def centre_random_augmentation(
     """
     rots = sample_rotations(shape=xl.shape[:-2], dtype=xl.dtype, device=xl.device)
 
-    trans = scale_trans * torch.randn(
+    trans = scale_trans * vendor_rng.randn(
         (*xl.shape[:-2], 3), dtype=xl.dtype, device=xl.device
     )
 

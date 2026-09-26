@@ -44,6 +44,7 @@ from openfold3.core.model.structure.pocket_constraints import (
     _feature_mask,
     _pocket_sampling_enabled,
 )
+from openfold3.core.utils import vendor_rng
 
 logger = logging.getLogger(__name__)
 
@@ -316,7 +317,7 @@ class SampleDiffusion(nn.Module):
             noise = (
                 self.noise_scale
                 * torch.sqrt(t**2 - noise_schedule[tau] ** 2)
-                * torch.randn_like(xl)
+                * vendor_rng.randn_like(xl)
             )
             xl_noisy = xl + noise
 
@@ -398,7 +399,7 @@ class SampleDiffusion(nn.Module):
 
         total_steps = len(noise_schedule) - 1
 
-        xl = noise_schedule[0] * torch.randn(
+        xl = noise_schedule[0] * vendor_rng.randn(
             (batch_dim, no_rollout_samples, num_atoms, 3),
             device=atom_mask.device,
             dtype=atom_mask.dtype,
@@ -454,15 +455,15 @@ class SampleDiffusion(nn.Module):
                 batch, atom_mask, "pocket_sampling_ligand_atom_mask"
             )
             lig = lig_mask[:, None, :, None]
-            lig_jitter = pocket_sampling_jitter * torch.randn(
+            lig_jitter = pocket_sampling_jitter * vendor_rng.randn(
                 (batch_dim, no_rollout_samples, 1, 3),
                 device=atom_mask.device,
                 dtype=atom_mask.dtype,
             )
             seed = torch.where(lig, seed + lig_jitter, seed)
-            xl = seed + noise_schedule[pocket_sampling_start_step] * torch.randn_like(
-                seed
-            )
+            xl = seed + noise_schedule[
+                pocket_sampling_start_step
+            ] * vendor_rng.randn_like(seed)
             logger.info(
                 "[pocket_sampling] start_frac=%.3f start_step=%s/%s "
                 "sigma=%.3g jitter=%.3g seed_proposals=%s",

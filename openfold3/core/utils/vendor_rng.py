@@ -68,30 +68,35 @@ def randperm(n: int, *, device=None, **kwargs) -> torch.Tensor:
     return torch.randperm(n, device="cpu", **kwargs).to(_device_of(device))
 
 
-def randint(low: int, high: int, size, *, device=None, **kwargs) -> torch.Tensor:
-    """``torch.randint``, drawn on CPU when enabled."""
-    if not enabled():
-        return torch.randint(low, high, size, device=device, **kwargs)
-    return torch.randint(low, high, size, device="cpu", **kwargs).to(_device_of(device))
+def randint(*args, device=None, **kwargs) -> torch.Tensor:
+    """``torch.randint``, drawn on CPU when enabled.
 
-
-def rand(size, *, device=None, **kwargs) -> torch.Tensor:
-    """``torch.rand``, drawn on CPU when enabled."""
-    if not enabled():
-        return torch.rand(size, device=device, **kwargs)
-    return torch.rand(size, device="cpu", **kwargs).to(_device_of(device))
-
-
-def randn(size, *, device=None, dtype=None, **kwargs) -> torch.Tensor:
-    """``torch.randn``, drawn on CPU when enabled.
-
-    Drawn directly in ``dtype`` so the enabled and disabled paths differ only in
-    where the numbers come from, not in rounding.
+    Variadic to accept both ``(high, size)`` and ``(low, high, size)``.
     """
     if not enabled():
-        return torch.randn(size, device=device, dtype=dtype, **kwargs)
-    out = torch.randn(size, device="cpu", dtype=dtype, **kwargs)
-    return out.to(_device_of(device))
+        return torch.randint(*args, device=device, **kwargs)
+    return torch.randint(*args, device="cpu", **kwargs).to(_device_of(device))
+
+
+def rand(*args, device=None, **kwargs) -> torch.Tensor:
+    """``torch.rand``, drawn on CPU when enabled."""
+    if not enabled():
+        return torch.rand(*args, device=device, **kwargs)
+    return torch.rand(*args, device="cpu", **kwargs).to(_device_of(device))
+
+
+def randn(*args, device=None, dtype=None, **kwargs) -> torch.Tensor:
+    """``torch.randn``, drawn on CPU when enabled.
+
+    Variadic to accept both ``randn(2, 3)`` and ``randn((2, 3))``. Drawn directly
+    in ``dtype`` so the enabled and disabled paths differ only in where the
+    numbers come from, not in rounding.
+    """
+    if not enabled():
+        return torch.randn(*args, device=device, dtype=dtype, **kwargs)
+    return torch.randn(*args, device="cpu", dtype=dtype, **kwargs).to(
+        _device_of(device)
+    )
 
 
 def randn_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -100,6 +105,15 @@ def randn_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
         return torch.randn_like(tensor, **kwargs)
     dtype = kwargs.pop("dtype", tensor.dtype)
     out = torch.randn(tensor.shape, device="cpu", dtype=dtype, **kwargs)
+    return out.to(tensor.device)
+
+
+def rand_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
+    """``torch.rand_like``, drawn on CPU when enabled."""
+    if not enabled():
+        return torch.rand_like(tensor, **kwargs)
+    dtype = kwargs.pop("dtype", tensor.dtype)
+    out = torch.rand(tensor.shape, device="cpu", dtype=dtype, **kwargs)
     return out.to(tensor.device)
 
 

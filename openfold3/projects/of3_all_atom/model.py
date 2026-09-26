@@ -41,6 +41,7 @@ from openfold3.core.model.structure.diffusion_module import (
     centre_random_augmentation,
     create_noise_schedule,
 )
+from openfold3.core.utils import vendor_rng
 from openfold3.core.utils.device_utils import autocast_device_type, empty_device_cache
 from openfold3.core.utils.permutation_alignment import (
     safe_multi_chain_permutation_alignment,
@@ -477,11 +478,11 @@ class OpenFold3(nn.Module):
 
         xl_gt = xl_gt.tile((1, no_samples, 1, 1))
         xl_gt = centre_random_augmentation(xl=xl_gt, atom_mask=atom_mask_gt)
-        n = torch.randn((batch_size, no_samples), device=device, dtype=dtype)
+        n = vendor_rng.randn((batch_size, no_samples), device=device, dtype=dtype)
         t = self.shared.diffusion.sigma_data * torch.exp(-1.2 + 1.5 * n)
 
         # Sample noise
-        noise = t[..., None, None] * torch.randn(
+        noise = t[..., None, None] * vendor_rng.randn(
             (batch_size, no_samples, n_atom, 3), device=device, dtype=dtype
         )
 

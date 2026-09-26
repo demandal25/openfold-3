@@ -30,6 +30,7 @@ from openfold3.core.model.layers.sequence_local_atom_attention import (
     AtomAttentionEncoder,
 )
 from openfold3.core.model.primitives import Linear
+from openfold3.core.utils import vendor_rng
 from openfold3.core.utils.device_utils import autocast_device_type
 from openfold3.core.utils.relpos import relpos_complex
 from openfold3.core.utils.tensor_utils import add
@@ -301,7 +302,7 @@ class MSAModuleEmbedder(nn.Module):
         max_msa_seqs_across_chains = max(per_chain_main_msa_dim)
 
         # Dimension to subsample all chains to
-        seq_subsample_dim = torch.randint(
+        seq_subsample_dim = vendor_rng.randint(
             low=1,
             high=int(max_msa_seqs_across_chains + 1),
             size=(1,),
@@ -313,7 +314,7 @@ class MSAModuleEmbedder(nn.Module):
         chain_index_permutations = [
             torch.cat(
                 [
-                    torch.randperm(num_seqs, device=msa_feat.device),
+                    vendor_rng.randperm(num_seqs, device=msa_feat.device),
                     torch.arange(
                         num_seqs, max_msa_seqs_across_chains, device=msa_feat.device
                     ),
@@ -401,14 +402,16 @@ class MSAModuleEmbedder(nn.Module):
         device = msa_feat.device
         # Pick msa from the valid ones at random
         if valid_idx.numel() >= no_subsampled_all_msa:
-            permuted_idx = valid_idx[torch.randperm(valid_idx.numel(), device=device)]
+            permuted_idx = valid_idx[
+                vendor_rng.randperm(valid_idx.numel(), device=device)
+            ]
             selected = permuted_idx[:no_subsampled_all_msa]
         else:
             # Take all valid, then fill with random invalid
             take_invalid = no_subsampled_all_msa - valid_idx.numel()
             if invalid_idx.numel() > 0:
                 permuted_idx = invalid_idx[
-                    torch.randperm(invalid_idx.numel(), device=device)
+                    vendor_rng.randperm(invalid_idx.numel(), device=device)
                 ]
                 selected = torch.cat([valid_idx, permuted_idx[:take_invalid]], dim=0)
             else:
@@ -538,7 +541,7 @@ class MSAModuleEmbedder(nn.Module):
                     asym_id=batch["asym_id"],
                 )
         elif self.subsample_all_msa:
-            no_subsampled_all_msa = torch.randint(
+            no_subsampled_all_msa = vendor_rng.randint(
                 low=self.min_subsampled_all_msa,
                 high=int(self.max_subsampled_all_msa + 1),
                 size=(1,),

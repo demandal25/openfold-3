@@ -22,6 +22,7 @@ from typing import NamedTuple, overload
 
 import torch
 
+from openfold3.core.utils import vendor_rng
 from openfold3.core.utils.atomize_utils import (
     broadcast_token_feat_to_atoms,
     get_token_center_atoms,
@@ -1825,7 +1826,7 @@ def safe_multi_chain_permutation_alignment(
             # values and the mask to all 1s, but disable all losses to not propagate a
             # signal to the model
             new_gt_features = batch["ground_truth"]
-            new_gt_features["atom_positions"] = torch.rand_like(
+            new_gt_features["atom_positions"] = vendor_rng.rand_like(
                 atom_positions_predicted
             )
             atom_mask = batch["atom_mask"]

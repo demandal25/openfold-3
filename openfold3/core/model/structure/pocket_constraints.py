@@ -26,6 +26,7 @@ from typing import NamedTuple
 import torch
 
 from openfold3.core.model.structure.augmentation import sample_rotations
+from openfold3.core.utils import vendor_rng
 
 logger = logging.getLogger(__name__)
 
@@ -185,25 +186,27 @@ def _build_pocket_sampling_seeds(
                     lig_rel = parent_rel
                 else:
                     lig_rel = conformers[
-                        torch.randint(conformers.shape[0], (), device=atom_mask.device)
+                        vendor_rng.randint(
+                            conformers.shape[0], (), device=atom_mask.device
+                        )
                     ]
                 rot = sample_rotations(
                     shape=(),
                     dtype=atom_mask.dtype,
                     device=atom_mask.device,
                 )
-                if torch.rand((), device=atom_mask.device) < 0.5:
+                if vendor_rng.rand((), device=atom_mask.device) < 0.5:
                     target = pocket_parent.mean(dim=0, keepdim=True)
-                    target = target + center_jitter * torch.randn(
+                    target = target + center_jitter * vendor_rng.randn(
                         (1, 3), dtype=atom_mask.dtype, device=atom_mask.device
                     )
                 else:
                     target = pocket_parent[
-                        torch.randint(
+                        vendor_rng.randint(
                             pocket_parent.shape[0], (), device=atom_mask.device
                         )
                     ].unsqueeze(0)
-                    target = target + surface_jitter * torch.randn(
+                    target = target + surface_jitter * vendor_rng.randn(
                         (1, 3), dtype=atom_mask.dtype, device=atom_mask.device
                     )
                 pose = lig_rel @ rot.transpose(-1, -2) + target

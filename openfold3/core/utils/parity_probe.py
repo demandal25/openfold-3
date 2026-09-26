@@ -135,20 +135,29 @@ class ParityProbeCallback(pl.Callback):
         module_patterns: tuple[str, ...] = DEFAULT_MODULE_PATTERNS,
         every_n_steps: int = 1,
         abort_on_nonfinite: bool = True,
+        max_firings_per_module: int = 16,
     ):
         super().__init__()
         if every_n_steps < 1:
             raise ValueError(f"every_n_steps must be >= 1, got {every_n_steps}")
+        if max_firings_per_module < 0:
+            raise ValueError("max_firings_per_module must be >= 0 (0 = unlimited)")
         self.output_dir = Path(output_dir)
         self.patterns = [re.compile(p) for p in module_patterns]
         self.every_n_steps = every_n_steps
         self.abort_on_nonfinite = abort_on_nonfinite
+        self.max_firings_per_module = max_firings_per_module
 
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._file = None
         self._ordinals: dict[str, int] = defaultdict(int)
         self._step = 0
         self._probing = False
+        #: True only between on_train_batch_start and on_train_batch_end.
+        #: Without it the validation loop's forwards are recorded too, and get
+        #: attributed to the preceding training step -- measured at ~20x the
+        #: real firing count on the 4-structure validation set.
+        self._in_train_batch = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -211,7 +220,7 @@ class ParityProbeCallback(pl.Callback):
 
     def _make_hook(self, name: str):
         def hook(_module, _inputs, output):
-            if not self._probing:
+            if not (self._probing and self._in_train_batch):
                 return
             tensor = output[0] if isinstance(output, tuple) else output
             if not isinstance(tensor, torch.Tensor):
@@ -221,6 +230,12 @@ class ParityProbeCallback(pl.Callback):
                 return
             ordinal = self._ordinals[name]
             self._ordinals[name] = ordinal + 1
+            # Beyond the cap the module is still counted but not recorded: the
+            # diffusion transformer fires ~842x per step under rollout, and the
+            # onset of a divergence is in the first few, not the last.
+            capped = self.max_firings_per_module
+            if capped and ordinal >= capped:
+                return
             self._emit(
                 kind="activation",
                 step=self._step,
@@ -238,6 +253,7 @@ class ParityProbeCallback(pl.Callback):
         self._step = int(trainer.global_step)
         self._ordinals.clear()
         self._probing = self._step % self.every_n_steps == 0
+        self._in_train_batch = True
         # Sample identity, every step: this is what separates an RNG/data desync
         # from a numeric divergence when two runs disagree.
         ids = batch.get("pdb_id") if isinstance(batch, dict) else None
@@ -308,5 +324,12 @@ class ParityProbeCallback(pl.Callback):
                 self._check_finite(stats, "gradient", name)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Full firing counts, even for modules capped above. Two runs whose
+        # counts differ are already divergent, and this is what makes that
+        # visible after capping.
+        self._in_train_batch = False
+        firings = {k: v for k, v in self._ordinals.items() if not k.startswith("__")}
+        if firings:
+            self._emit(kind="firings", step=self._step, counts=firings)
         if self._file is not None:
             self._file.flush()

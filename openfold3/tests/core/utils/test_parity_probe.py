@@ -181,6 +181,56 @@ def test_can_be_told_not_to_abort(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The validation leak
+# ---------------------------------------------------------------------------
+
+
+class _WithValidation(_ManualModule):
+    def validation_step(self, batch, batch_idx):
+        (inputs,) = batch
+        return self(inputs).pow(2).sum()
+
+
+def test_validation_forwards_are_not_recorded(tmp_path):
+    """Validation must not inflate a training step's firing counts.
+
+    Found on the real model: the probe recorded the validation loop's forwards
+    and attributed them to the preceding training step, ~20x the real count.
+    """
+    probe = ParityProbeCallback(output_dir=tmp_path, module_patterns=(r"blocks\.\d+$",))
+    train = DataLoader(TensorDataset(torch.randn(4, 4)), batch_size=2)
+    val = DataLoader(TensorDataset(torch.randn(8, 4)), batch_size=2)
+    torch.manual_seed(0)
+    pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+        callbacks=[probe],
+    ).fit(_WithValidation(), train, val)
+
+    rows = _rows(tmp_path)
+    firings = _by_kind(rows, "firings")
+    assert firings, "no firings rows"
+    # One forward per module per training batch, and nothing from the 4
+    # validation batches that follow.
+    for row in firings:
+        assert set(row["counts"].values()) == {1}, row["counts"]
+
+    recorded = {}
+    for row in _by_kind(rows, "activation"):
+        recorded.setdefault(row["step"], []).append(row["module"])
+    for step, modules in recorded.items():
+        assert len(modules) == len(set(modules)), (
+            f"step {step} recorded a module twice; validation leaked in"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Hygiene
 # ---------------------------------------------------------------------------
 

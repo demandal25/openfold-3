@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -332,6 +333,59 @@ def _fmt(verdict: Verdict, factor: float) -> str:
     return "\n".join(lines)
 
 
+def growth_table(
+    cross: dict[int, tuple[float, str | None]],
+    null: dict[int, tuple[float, str | None]],
+    *,
+    buckets: int = 10,
+) -> list[dict]:
+    """Coarse divergence-growth curve, for the cumulative-instability question.
+
+    A single pass/fail hides the shape. When the answer is "does this grow", the
+    shape *is* the answer: a cross curve whose ratio to the null climbs steadily
+    says something a threshold crossing does not.
+    """
+    steps = sorted(cross)
+    if not steps:
+        return []
+    size = max(1, len(steps) // buckets)
+    rows = []
+    for start in range(0, len(steps), size):
+        window = steps[start : start + size]
+        cross_mean = sum(cross[s][0] for s in window) / len(window)
+        null_values = [null[s][0] for s in window if s in null]
+        null_mean = sum(null_values) / len(null_values) if null_values else 0.0
+        rows.append(
+            {
+                "from_step": window[0],
+                "to_step": window[-1],
+                "cross": cross_mean,
+                "null": null_mean,
+                "ratio": cross_mean / max(null_mean, NULL_FLOOR),
+            }
+        )
+    return rows
+
+
+def _fmt_growth(rows: list[dict]) -> str:
+    if not rows:
+        return "no steps to chart"
+    lines = ["", "  steps            cross      null    ratio", "  " + "-" * 42]
+    peak = max(r["ratio"] for r in rows) or 1.0
+    for row in rows:
+        bar = "#" * max(1, round(20 * row["ratio"] / peak))
+        lines.append(
+            f"  {row['from_step']:>6}-{row['to_step']:<7} {row['cross']:.2e} "
+            f"{row['null']:.2e} {row['ratio']:7.2f}x {bar}"
+        )
+    trend = rows[-1]["ratio"] - rows[0]["ratio"]
+    lines.append(
+        f"  trend: {'rising' if trend > 0 else 'flat or falling'} "
+        f"({rows[0]['ratio']:.2f}x -> {rows[-1]['ratio']:.2f}x)"
+    )
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -357,43 +411,88 @@ def main(argv=None) -> int:
         "--after", type=int, default=100, help="ignore steps below this"
     )
     parser.add_argument("--json", type=Path, help="write the verdict here")
+    parser.add_argument(
+        "--growth",
+        action="store_true",
+        help="print the divergence-growth curve. For cumulative instability the "
+        "shape is the answer, not the pass/fail.",
+    )
+    parser.add_argument(
+        "--watch",
+        type=float,
+        metavar="SECONDS",
+        help="re-read and re-report on an interval against a live run. The probe "
+        "writes line-buffered, so this works while training is in flight and "
+        "lets you stop early instead of finding out at the end.",
+    )
     args = parser.parse_args(argv)
 
     if args.factor <= 0 or args.consecutive < 1 or args.after < 0:
         parser.error("--factor must be > 0, --consecutive >= 1, --after >= 0")
 
+    def once(quiet_errors: bool) -> int | None:
+        """One comparison pass. ``None`` means retry later (watch mode only)."""
+        try:
+            cross_pair = (
+                load(Path(args.cross[0]), "cross-A"),
+                load(Path(args.cross[1]), "cross-B"),
+            )
+            null_pair = (
+                (load(Path(args.null[0]), "null-A"), load(Path(args.null[1]), "null-B"))
+                if args.null
+                else None
+            )
+            verdict = compare(
+                cross_pair,
+                null_pair,
+                factor=args.factor,
+                consecutive=args.consecutive,
+                after=args.after,
+            )
+        except InputError as exc:
+            # A live run may not have written enough yet; that is not an error
+            # until we stop waiting for it.
+            if quiet_errors:
+                print(f"waiting: {exc}", file=sys.stderr)
+                return None
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        if null_pair is None:
+            print(
+                "warning: no --null arms; the envelope is a fixed floor",
+                file=sys.stderr,
+            )
+        print(_fmt(verdict, args.factor))
+        if args.growth:
+            null_curve = curve(*null_pair) if null_pair else {}
+            print(_fmt_growth(growth_table(curve(*cross_pair), null_curve)))
+
+        if args.json:
+            args.json.parent.mkdir(parents=True, exist_ok=True)
+            args.json.write_text(json.dumps(vars(verdict), indent=2, sort_keys=True))
+
+        if verdict.inconclusive:
+            return 2
+        return 1 if verdict.diverged else 0
+
+    if args.watch is None:
+        return once(quiet_errors=False)
+
+    if args.watch <= 0:
+        parser.error("--watch must be a positive number of seconds")
     try:
-        cross_pair = (
-            load(Path(args.cross[0]), "cross-A"),
-            load(Path(args.cross[1]), "cross-B"),
-        )
-        null_pair = (
-            (load(Path(args.null[0]), "null-A"), load(Path(args.null[1]), "null-B"))
-            if args.null
-            else None
-        )
-        verdict = compare(
-            cross_pair,
-            null_pair,
-            factor=args.factor,
-            consecutive=args.consecutive,
-            after=args.after,
-        )
-    except InputError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    if null_pair is None:
-        print("warning: no --null arms; the envelope is a fixed floor", file=sys.stderr)
-    print(_fmt(verdict, args.factor))
-
-    if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(vars(verdict), indent=2, sort_keys=True))
-
-    if verdict.inconclusive:
-        return 2
-    return 1 if verdict.diverged else 0
+        while True:
+            print(f"--- {time.strftime('%H:%M:%S')} ---")
+            code = once(quiet_errors=True)
+            # Stop as soon as there is something to act on; keep waiting while
+            # the arms still agree.
+            if code == 1:
+                return 1
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print("\nwatch interrupted", file=sys.stderr)
+        return 0
 
 
 if __name__ == "__main__":

@@ -79,6 +79,14 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export MIOPEN_FIND_MODE=NORMAL
 export TORCHINDUCTOR_COMPILE_THREADS=1
 
+# --- anchor to the tree this script lives in --------------------------------
+# The editable install resolves openfold3 by cwd, so a run launched from
+# elsewhere silently imports a different checkout. Anchor, do not inherit.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+echo "repo root: $REPO_ROOT"
+
 # --- refuse to run on a tree that cannot be pinned to a commit --------------
 GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY=0
@@ -105,6 +113,8 @@ import hashlib, json, os, pathlib, platform, subprocess, sys
 out, yaml_path, seed, sha, dirty, workers, devices = sys.argv[1:8]
 
 import torch
+
+import openfold3
 
 def run(*cmd):
     try:
@@ -137,6 +147,9 @@ record = {
         "NCCL_ALGO", "NCCL_PROTO", "RCCL_ALGO",
     )},
     "host": {"hostname": platform.node(), "python": platform.python_version()},
+    # Which tree actually got imported. The editable install resolves by cwd, so
+    # a run launched from the wrong directory silently tests a different commit.
+    "openfold3_path": str(pathlib.Path(openfold3.__file__).resolve().parent),
     "rocm_version": run("cat", "/opt/rocm/.info/version"),
     "packages": run(sys.executable, "-m", "pip", "freeze"),
 }
@@ -163,8 +176,9 @@ PY
 # reach the run the same way (inheritance through exec). Everything else is
 # checked by reading the runner yaml, since asserting it in a throwaway process
 # would prove nothing about the training process.
-python - "$RUNNER_YAML" <<'PY'
-import os, sys
+OF3_EXPECTED_ROOT="$REPO_ROOT" python - "$RUNNER_YAML" <<'PY'
+import os, pathlib, sys
+
 import yaml
 
 failures = []
@@ -172,10 +186,19 @@ failures = []
 if os.environ.get("OF3_VENDOR_INDEPENDENT_RNG") != "1":
     failures.append("OF3_VENDOR_INDEPENDENT_RNG did not reach the process")
 
+import openfold3
 from openfold3.core.utils import vendor_rng
 
 if not vendor_rng.enabled():
     failures.append("vendor_rng is off despite the environment variable")
+
+imported = pathlib.Path(openfold3.__file__).resolve().parent
+expected = pathlib.Path(os.environ["OF3_EXPECTED_ROOT"]).resolve() / "openfold3"
+if imported != expected:
+    failures.append(
+        f"openfold3 imported from {imported}, not {expected} -- the run would "
+        f"test a different checkout than the one it was launched from"
+    )
 
 with open(sys.argv[1]) as handle:
     config = yaml.safe_load(handle) or {}

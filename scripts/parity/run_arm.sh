@@ -240,6 +240,27 @@ print(
 )
 PY
 
+# --- multi-node rendezvous ------------------------------------------------
+# Lightning forms the process group from SLURM_* when launched under srun. With
+# neither SLURM nor explicit rendezvous variables, a num_nodes > 1 run has no
+# mechanism to form one: it hangs, or silently runs as N independent
+# single-node jobs. Refuse rather than produce either.
+NUM_NODES_CFG="$(python -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])) or {}; print((c.get("pl_trainer_args") or {}).get("num_nodes",1))' "$RUNNER_YAML")"
+if [[ "$NUM_NODES_CFG" -gt 1 ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        echo "multi-node: $NUM_NODES_CFG nodes via SLURM job ${SLURM_JOB_ID}"
+    elif [[ -n "${MASTER_ADDR:-}" && -n "${MASTER_PORT:-}" && -n "${WORLD_SIZE:-}" ]]; then
+        echo "multi-node: $NUM_NODES_CFG nodes via MASTER_ADDR=${MASTER_ADDR}"
+    else
+        cat >&2 <<EOF
+refusing to launch: the runner yaml asks for num_nodes=$NUM_NODES_CFG but there
+is no rendezvous. Launch under srun, or export MASTER_ADDR, MASTER_PORT and
+WORLD_SIZE before calling this script.
+EOF
+        exit 2
+    fi
+fi
+
 CMD=(run_openfold train --runner-yaml "$RUNNER_YAML" --seed "$SEED")
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

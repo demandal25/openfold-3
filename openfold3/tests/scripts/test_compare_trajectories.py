@@ -305,3 +305,96 @@ def test_run_directory_is_accepted(tmp_path, arms):
 def test_rejects_nonsense_thresholds(arms):
     with pytest.raises(SystemExit):
         _run((arms["cross_a"], arms["cross_b"]), extra=["--factor", "0"])
+
+
+# ---------------------------------------------------------------------------
+# --growth and --watch
+# ---------------------------------------------------------------------------
+
+
+def test_growth_table_shows_a_rising_ratio(tmp_path, arms):
+    """For the cumulative question the shape is the answer, not the pass/fail."""
+    rows = [json.loads(line) for line in arms["cross_b"].read_text().splitlines()]
+    for row in rows:
+        if row["kind"] == "activation":
+            # divergence that grows with step, rather than a step change
+            row["mean"] *= 1.0 + row["step"] / 200.0
+    creeping = tmp_path / "creeping.jsonl"
+    creeping.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n")
+
+    cross = ct.curve(ct.load(arms["cross_a"], "a"), ct.load(creeping, "b"))
+    null = ct.curve(ct.load(arms["null_a"], "na"), ct.load(arms["null_b"], "nb"))
+    table = ct.growth_table(cross, null, buckets=5)
+
+    assert len(table) >= 5
+    assert table[-1]["ratio"] > table[0]["ratio"], "a growing divergence read as flat"
+    assert "rising" in ct._fmt_growth(table)
+
+
+def test_growth_table_on_a_clean_pair_is_flat(tmp_path, arms):
+    cross = ct.curve(ct.load(arms["cross_a"], "a"), ct.load(arms["cross_b"], "b"))
+    null = ct.curve(ct.load(arms["null_a"], "na"), ct.load(arms["null_b"], "nb"))
+    table = ct.growth_table(cross, null, buckets=5)
+    ratios = [row["ratio"] for row in table]
+    assert max(ratios) / max(min(ratios), 1e-9) < 5, (
+        f"clean pair looks like a trend: {ratios}"
+    )
+
+
+def test_growth_table_is_empty_without_shared_steps():
+    assert ct.growth_table({}, {}) == []
+    assert "no steps" in ct._fmt_growth([])
+
+
+def test_growth_flag_prints_the_table(tmp_path, arms, capsys):
+    _run(
+        (arms["cross_a"], arms["cross_b"]),
+        (arms["null_a"], arms["null_b"]),
+        ["--growth"],
+    )
+    out = capsys.readouterr().out
+    assert "ratio" in out and "trend:" in out
+
+
+def test_watch_returns_on_divergence(tmp_path, arms):
+    """Watch mode must stop as soon as there is something to act on."""
+    bad = write_trajectory(tmp_path / "bad.jsonl", seed=4, inject_at=120)
+    assert (
+        _run(
+            (arms["cross_a"], bad),
+            (arms["null_a"], arms["null_b"]),
+            ["--watch", "0.01"],
+        )
+        == 1
+    )
+
+
+def test_watch_rejects_a_non_positive_interval(arms):
+    with pytest.raises(SystemExit):
+        _run((arms["cross_a"], arms["cross_b"]), extra=["--watch", "0"])
+
+
+def test_watch_waits_instead_of_erroring_on_a_missing_file(tmp_path, arms, capsys):
+    """A live run may not have written anything yet; that is not an error."""
+    import threading
+
+    late = tmp_path / "late.jsonl"
+
+    def write_later():
+        import time as _t
+
+        _t.sleep(0.4)
+        write_trajectory(late, seed=4, inject_at=120)
+
+    thread = threading.Thread(target=write_later)
+    thread.start()
+    try:
+        code = _run(
+            (arms["cross_a"], late),
+            (arms["null_a"], arms["null_b"]),
+            ["--watch", "0.2"],
+        )
+    finally:
+        thread.join()
+    assert code == 1
+    assert "waiting:" in capsys.readouterr().err

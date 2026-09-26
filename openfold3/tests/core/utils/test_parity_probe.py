@@ -336,3 +336,74 @@ def test_trunk_and_confidence_head_stacks_are_not_conflated():
     assert next(iter(trunk.values())) == 3, (
         "trunk pattern is picking up another stack's blocks"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review findings
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_to_append_to_an_existing_trajectory(tmp_path):
+    """A restart into the same dir would splice two runs into one file, and the
+    loader keeps only the last row per key."""
+    (tmp_path / "trajectory_rank0.jsonl").write_text('{"kind":"loss","step":0}\n')
+    probe = ParityProbeCallback(output_dir=tmp_path)
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    with pytest.raises(FileExistsError, match="already holds a trajectory"):
+        probe.setup(trainer, _ManualModule(), stage="fit")
+
+
+def test_an_empty_existing_file_is_not_an_obstacle(tmp_path):
+    (tmp_path / "trajectory_rank0.jsonl").write_text("")
+    probe = ParityProbeCallback(output_dir=tmp_path)
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    probe.setup(trainer, _ManualModule(), stage="fit")
+    probe.teardown(trainer, None, stage="fit")
+
+
+def test_warns_when_no_parameter_has_a_gradient(tmp_path, caplog):
+    """Under DeepSpeed/ZeRO param.grad is None; silence would leave the whole
+    gradient half of the trajectory missing with no signal."""
+    probe = ParityProbeCallback(output_dir=tmp_path)
+    module = _ManualModule()
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    probe.setup(trainer, module, stage="fit")
+    try:
+        probe.on_before_optimizer_step(trainer, module, None)
+        probe.on_before_optimizer_step(trainer, module, None)
+    finally:
+        probe.teardown(trainer, module, stage="fit")
+    warnings = [r for r in caplog.records if "no parameter has .grad" in r.message]
+    assert len(warnings) == 1, "should warn once, not every step"
+
+
+def test_rows_carry_batch_idx_so_accumulation_cannot_collide(tmp_path):
+    """Micro-batches share a global_step; without batch_idx their rows overwrite."""
+    torch.manual_seed(0)
+    _run(tmp_path, steps=2)
+    rows = _rows(tmp_path)
+    assert all("batch_idx" in r for r in rows), "a row is missing batch_idx"

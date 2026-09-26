@@ -43,8 +43,21 @@ def _configure_torch_backend():
 
     import torch
 
-    # Force the cuBLAS backend on AMD/ROCm to match the numerics of
-    # NVIDIA-trained models.
-    if torch.cuda.is_available() and torch.version.hip is not None:
-        library = os.environ.get("OF3_BLAS_LIBRARY", "cublas")
+    library = os.environ.get("OF3_BLAS_LIBRARY")
+    if library is not None and library.lower() not in (
+        "cublas",
+        "cublaslt",
+        "hipblaslt",
+    ):
+        raise ValueError(
+            f"OF3_BLAS_LIBRARY={library!r} is not one of cublas, cublaslt, hipblaslt"
+        )
+    if not torch.cuda.is_available():
+        return
+    if torch.version.hip is not None:
+        # Force the cuBLAS backend on AMD/ROCm to match the numerics of
+        # NVIDIA-trained models.
+        torch.backends.cuda.preferred_blas_library(library or "cublas")
+    elif library is not None:
+        # Honoured on CUDA too, so the same control arm can run on both legs.
         torch.backends.cuda.preferred_blas_library(library)

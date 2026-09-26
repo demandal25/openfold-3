@@ -14,19 +14,11 @@
 
 """Vendor-independent RNG draws, for cross-vendor comparison runs.
 
-Device RNG is not portable: CUDA and ROCm disagree on ``randperm`` (different
-sort backends) and on per-call offset advancement, so two runs of the same model
-on the two vendors diverge before any arithmetic happens. When enabled, these
-helpers draw on CPU and copy to the device instead.
+Device RNG is not portable between CUDA and ROCm, so these draw on CPU and copy
+to the device. They use the *default* CPU generator, which is the only one
+``torch.utils.checkpoint`` rewinds on recompute.
 
-The draws deliberately use the *default* CPU generator rather than a private
-one: ``torch.utils.checkpoint`` saves and restores ``torch.get_rng_state()``, so
-only the default generator is rewound when a checkpointed block is recomputed
-during backward. A private generator would yield different dropout masks on the
-recompute pass and silently corrupt gradients.
-
-Off by default; enable with ``OF3_VENDOR_INDEPENDENT_RNG=1`` or
-:func:`set_enabled`. Costs a host-to-device copy per draw.
+Off by default; enable with ``OF3_VENDOR_INDEPENDENT_RNG=1``.
 """
 
 from __future__ import annotations

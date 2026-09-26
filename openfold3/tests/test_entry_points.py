@@ -1311,3 +1311,32 @@ def test_skip_random_init_context_manager():
 
     # function should be restored
     assert initialization.trunc_normal_init_ is original_func
+
+
+def test_checkpoint_dirpath_is_pinned_against_the_logger(tmp_path):
+    """Adding a logger relocates checkpoints unless dirpath is set.
+
+    Measured with Lightning's own resolver:
+      no logger           -> <output_dir>/checkpoints
+      with CSVLogger      -> <output_dir>/logs/checkpoints
+    A resume expecting last.ckpt at the old path would silently restart.
+    """
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+    from pytorch_lightning.loggers import CSVLogger
+
+    def resolve(loggers, dirpath=None):
+        trainer = pl.Trainer(
+            default_root_dir=tmp_path,
+            logger=loggers,
+            accelerator="cpu",
+            devices=1,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+        )
+        callback = ModelCheckpoint(save_last=True, dirpath=dirpath)
+        return str(callback._ModelCheckpoint__resolve_ckpt_dir(trainer))
+
+    csv = [CSVLogger(save_dir=tmp_path / "logs", name="", version="")]
+    assert resolve(False) != resolve(csv), "relocation no longer reproduces"
+    assert resolve(csv, tmp_path / "checkpoints") == resolve(False)

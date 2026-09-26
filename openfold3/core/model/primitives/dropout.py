@@ -41,6 +41,8 @@ class Dropout(nn.Module):
         """
         super().__init__()
 
+        if not 0.0 <= r <= 1.0:
+            raise ValueError(f"dropout probability must be in [0, 1], got {r}")
         self.r = r
         if isinstance(batch_dim, int):
             batch_dim = [batch_dim]

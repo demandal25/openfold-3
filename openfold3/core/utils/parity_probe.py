@@ -14,22 +14,9 @@
 
 """Per-step trajectory records, for comparing two training runs step by step.
 
-End-of-run metrics cannot localise a divergence. This writes one JSONL row per
-observation so two runs can be aligned and the *first* disagreeing step and
-module identified.
-
-Every activation row carries ``(step, module, ordinal)``, where ordinal counts
-firings of that module within the step. That is not bookkeeping: ``num_recycles``
-is drawn per step, the MSA embedder sits inside the recycle loop, the diffusion
-rollout adds forwards, and activation checkpointing re-runs blocks during
-backward — so a module fires a variable number of times per step. Two runs whose
-firing counts differ are *already* divergent, and the ordinal makes that visible
-instead of silently shifting every later comparison.
-
-Deliberately no forward/backward label: OF3's training step interleaves them
-(``runner.py`` calls ``manual_backward`` per sample inside the loop), so a phase
-flag driven by Lightning hooks would be wrong after the first sample. The
-ordinal alone is unambiguous.
+Rows are keyed ``(step, batch_idx, module, ordinal)``. A module fires a variable
+number of times per step -- recycles, diffusion rollout, checkpoint recompute --
+so the ordinal is what keeps two runs aligned.
 """
 
 from __future__ import annotations
@@ -118,15 +105,8 @@ def _stats(tensor: torch.Tensor) -> dict | None:
 class ParityProbeCallback(pl.Callback):
     """Write a per-step trajectory record for cross-vendor comparison.
 
-    Args:
-        output_dir: Directory for ``trajectory_rank<N>.jsonl``.
-        module_patterns: Regexes matched against dotted module names.
-        every_n_steps: How often to record the expensive per-module and
-            per-parameter detail. A cheap global gradient summary and the batch
-            identity are recorded on *every* step regardless, so a loss spike or
-            NaN is never missed between probe steps.
-        abort_on_nonfinite: Stop at the first non-finite value rather than let it
-            propagate into a run that is no longer comparable.
+    ``every_n_steps`` thins the per-module and per-parameter detail only; the
+    gradient summary and batch identity are recorded every step.
     """
 
     def __init__(
@@ -154,6 +134,7 @@ class ParityProbeCallback(pl.Callback):
         self._step = 0
         self._batch_idx = 0
         self._probing = False
+        self._warned_no_grads = False
         #: True only between on_train_batch_start and on_train_batch_end.
         #: Without it the validation loop's forwards are recorded too, and get
         #: attributed to the preceding training step -- measured at ~20x the
@@ -167,8 +148,14 @@ class ParityProbeCallback(pl.Callback):
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = self.output_dir / f"trajectory_rank{trainer.global_rank}.jsonl"
+        if path.exists() and path.stat().st_size:
+            raise FileExistsError(
+                f"{path} already holds a trajectory. Appending would splice two "
+                f"runs into one file and the loader keeps only the last row per "
+                f"key. Use a fresh output_dir, or move the old file aside."
+            )
         # Line-buffered, so a run killed by a hang still leaves a usable trace.
-        self._file = path.open("a", buffering=1)
+        self._file = path.open("w", buffering=1)
         self._register_hooks(pl_module)
         logger.info(
             "ParityProbe: %d modules matched, writing %s", len(self._handles), path
@@ -287,6 +274,14 @@ class ParityProbeCallback(pl.Callback):
             if param.grad is not None and torch.is_floating_point(param.grad)
         ]
         if not named_grads:
+            if not self._warned_no_grads:
+                self._warned_no_grads = True
+                logger.warning(
+                    "ParityProbe: no parameter has .grad at the optimizer step, "
+                    "so no gradients will be recorded. Under DeepSpeed/ZeRO the "
+                    "grads are partitioned and .grad is None; this harness pins "
+                    "DDP, so a run reaching here is misconfigured."
+                )
             return
 
         # Accumulate on device and sync once: a per-parameter .item() here would

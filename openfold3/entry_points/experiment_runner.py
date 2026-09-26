@@ -613,7 +613,13 @@ class TrainingExperimentRunner(ExperimentRunner):
 
         _checkpoint = self.checkpoint_config
         if _checkpoint is not None:
-            _callbacks.append(ModelCheckpoint(**_checkpoint.model_dump()))
+            _ckpt_args = _checkpoint.model_dump()
+            # Pinned, because ModelCheckpoint otherwise resolves dirpath
+            # from loggers[0].save_dir: adding the CSV logger would move
+            # checkpoints to <output_dir>/logs/checkpoints and orphan
+            # anything a resume expects at the old path.
+            _ckpt_args.setdefault("dirpath", self.output_dir / "checkpoints")
+            _callbacks.append(ModelCheckpoint(**_ckpt_args))
 
         if self.model_config.settings.debug.log_iteration_time:
             _callbacks.append(PredictTimer(output_dir=None))

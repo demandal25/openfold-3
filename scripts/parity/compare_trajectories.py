@@ -15,23 +15,12 @@
 
 """Compare two training trajectories step by step.
 
-Two runs launched with the same seed share their initial weights, their recycle
-schedule and their sample order, so the only thing left to differ is arithmetic.
-Measured on MI355X: two same-seed runs are bit-identical, 0.0 at every step. The
-comparison is therefore a direct diff, not a statistical test -- no envelope, no
-threshold.
+Same-seed runs are bit-identical on one vendor, so this is a direct diff rather
+than a statistical test. It reports where the runs stopped agreeing, how fast
+the gap grows, and whether the cause was arithmetic or a desync -- a desync
+means they did different work, so it is checked first.
 
-What this reports is where the two runs stopped agreeing, how fast the gap
-grows, and whether the cause was arithmetic or a desync. A desync means the two
-runs did different work, which makes the numbers incomparable rather than merely
-different, so it is checked first.
-
-Pass ``--reference`` to plot a second pair alongside for scale -- the natural
-one is the same vendor with a different BLAS backend, which shows how far a
-legitimate implementation swap moves the trajectory.
-
-Exit codes: 0 compared, 1 actionable finding (non-finite, desync, or over
-``--fail-above``), 2 unusable input.
+Exit codes: 0 compared, 1 actionable finding, 2 unusable input.
 """
 
 from __future__ import annotations

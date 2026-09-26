@@ -13,20 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare two training trajectories against an intra-vendor null.
+"""Compare two training trajectories step by step.
 
-Two bf16 runs diverge at epsilon on step one and amplify chaotically even when
-both are healthy, so "AMD and NVIDIA differ" is not a finding on its own. What
-makes it one is the cross-vendor divergence sitting *above* the divergence
-between two same-vendor runs that differ only by seed.
+Two runs launched with the same seed share their initial weights, their recycle
+schedule and their sample order, so the only thing left to differ is arithmetic.
+Measured on MI355X: two same-seed runs are bit-identical, 0.0 at every step. The
+comparison is therefore a direct diff, not a statistical test -- no envelope, no
+threshold.
 
-    cross = |AMD seed A - NVIDIA seed A|      null = |AMD seed A - AMD seed B|
+What this reports is where the two runs stopped agreeing, how fast the gap
+grows, and whether the cause was arithmetic or a desync. A desync means the two
+runs did different work, which makes the numbers incomparable rather than merely
+different, so it is checked first.
 
-A cross curve inside the null envelope is parity. Above it, this reports the
-first step and module that separated, and whether the cause was numeric or an
-RNG/data desync -- a module name alone is not a diagnosis.
+Pass ``--reference`` to plot a second pair alongside for scale -- the natural
+one is the same vendor with a different BLAS backend, which shows how far a
+legitimate implementation swap moves the trajectory.
 
-Exit codes: 0 parity, 1 divergence, 2 unusable input or an inconclusive run.
+Exit codes: 0 compared, 1 actionable finding (non-finite, desync, or over
+``--fail-above``), 2 unusable input.
 """
 
 from __future__ import annotations
@@ -40,9 +45,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 EPS = 1e-12
-#: Floor on the null curve. Without it, a step where the two same-vendor runs
-#: happen to agree exactly makes any cross-vendor difference look infinite.
-NULL_FLOOR = 1e-7
 
 
 class InputError(Exception):
@@ -54,14 +56,12 @@ class Trajectory:
     """One arm's records, indexed for comparison."""
 
     label: str
-    #: step -> (module, ordinal) -> {field: value}
+    #: step -> (module, ordinal) -> row
     activations: dict[int, dict[tuple[str, int], dict]] = field(default_factory=dict)
-    #: step -> {field: value}
     grad_summary: dict[int, dict] = field(default_factory=dict)
-    #: step -> list of sample ids
     batch_ids: dict[int, list[str]] = field(default_factory=dict)
-    #: step -> list of loss values, by ordinal
     losses: dict[int, list[float]] = field(default_factory=dict)
+    firings: dict[int, dict[str, int]] = field(default_factory=dict)
     nonfinite_steps: list[int] = field(default_factory=list)
 
     @property
@@ -102,14 +102,17 @@ def load(path: Path, label: str) -> Trajectory:
         if row.get("nonfinite"):
             traj.nonfinite_steps.append(step)
         if kind == "activation":
-            key = (row["module"], int(row["ordinal"]))
-            traj.activations.setdefault(step, {})[key] = row
+            traj.activations.setdefault(step, {})[
+                (row["module"], int(row["ordinal"]))
+            ] = row
         elif kind == "grad_summary":
             traj.grad_summary[step] = row
         elif kind == "batch":
             traj.batch_ids[step] = [str(i) for i in row.get("ids", [])]
         elif kind == "loss":
             traj.losses.setdefault(step, []).append(float(row["value"]))
+        elif kind == "firings":
+            traj.firings[step] = dict(row.get("counts", {}))
 
     if not traj.steps:
         raise InputError(f"{path}: no comparable records")
@@ -120,8 +123,7 @@ def rel_diff(a: float, b: float) -> float:
     """Relative difference, symmetric and safe at zero."""
     if not (math.isfinite(a) and math.isfinite(b)):
         return math.inf
-    denom = max(abs(a), abs(b), EPS)
-    return abs(a - b) / denom
+    return abs(a - b) / max(abs(a), abs(b), EPS)
 
 
 def step_divergence(
@@ -152,29 +154,39 @@ def step_divergence(
 def classify(left: Trajectory, right: Trajectory, step: int) -> tuple[str, str]:
     """Why the two arms differ at *step*: desync or arithmetic.
 
-    Checked before any numeric comparison, because a desync makes the numbers
-    incomparable rather than merely different.
+    Checked before any numeric comparison, because a desync means the runs did
+    different work and the numbers are not comparable at all.
     """
     lb, rb = left.batch_ids.get(step), right.batch_ids.get(step)
     if lb is not None and rb is not None and lb != rb:
         return "data-desync", f"different samples: {lb} vs {rb}"
 
+    lf, rf = left.firings.get(step), right.firings.get(step)
+    if lf and rf and lf != rf:
+        differing = [k for k in set(lf) | set(rf) if lf.get(k) != rf.get(k)]
+        example = sorted(differing)[0]
+        return (
+            "execution-desync",
+            f"{len(differing)} modules fired a different number of times "
+            f"(recycle count?), e.g. {example}: {lf.get(example)} vs "
+            f"{rf.get(example)}",
+        )
+
+    # Fallback for trajectories without firings rows: compare the recorded
+    # activation keys directly. Weaker, because capping truncates them.
     lhs, rhs = left.activations.get(step, {}), right.activations.get(step, {})
-    if lhs and rhs and lhs.keys() != rhs.keys():
+    if not (lf and rf) and lhs and rhs and lhs.keys() != rhs.keys():
         only_left = sorted(str(k) for k in lhs.keys() - rhs.keys())[:3]
         only_right = sorted(str(k) for k in rhs.keys() - lhs.keys())[:3]
         return (
             "execution-desync",
-            f"different module firings (recycle count?): "
-            f"{left.label} only {only_left}, {right.label} only {only_right}",
+            f"different module firings (recycle count?): {left.label} only "
+            f"{only_left}, {right.label} only {only_right}",
         )
 
     ll, rl = left.losses.get(step, []), right.losses.get(step, [])
     if len(ll) != len(rl):
-        return (
-            "execution-desync",
-            f"different backward count: {len(ll)} vs {len(rl)}",
-        )
+        return "execution-desync", f"different backward count: {len(ll)} vs {len(rl)}"
 
     return "numeric", "same samples and same module firings; values differ"
 
@@ -185,166 +197,65 @@ def curve(left: Trajectory, right: Trajectory) -> dict[int, tuple[float, str | N
 
 
 @dataclass
-class Verdict:
-    diverged: bool
-    inconclusive: bool = False
-    first_step: int | None = None
-    module: str | None = None
+class Report:
+    steps_compared: int = 0
+    first_divergent_step: int | None = None
+    first_divergent_module: str | None = None
     kind: str | None = None
     detail: str | None = None
-    cross_value: float | None = None
-    null_value: float | None = None
-    reason: str = ""
+    max_divergence: float = 0.0
+    max_divergence_step: int | None = None
+    max_divergence_module: str | None = None
+    final_divergence: float = 0.0
+    growing: bool = False
+    nonfinite_step: int | None = None
+    nonfinite_arm: str | None = None
+    actionable: bool = False
 
 
-def find_divergence(
-    cross: dict[int, tuple[float, str | None]],
-    null: dict[int, tuple[float, str | None]],
-    *,
-    factor: float,
-    consecutive: int,
-    after: int,
-) -> tuple[list[int], dict[int, float], bool]:
-    """Steps where cross exceeds ``factor`` x null, the ratio series, and whether
-    an exceeding run was still open when the data ran out."""
-    ratios: dict[int, float] = {}
-    for step, (value, _) in cross.items():
-        if step < after:
-            continue
-        null_value = max(null.get(step, (0.0, None))[0], NULL_FLOOR)
-        ratios[step] = value / null_value
-
-    exceeding = sorted(s for s, r in ratios.items() if r > factor)
-    if not exceeding:
-        return [], ratios, False
-
-    # A run of `consecutive` steps that are consecutive *among compared steps*,
-    # so thinning with every_n_steps does not defeat the rule.
-    ordered = sorted(ratios)
-    index = {s: i for i, s in enumerate(ordered)}
-    run: list[int] = []
-    longest: list[int] = []
-    for step in exceeding:
-        run = run + [step] if run and index[step] == index[run[-1]] + 1 else [step]
-        if len(run) > len(longest):
-            longest = list(run)
-        if len(run) >= consecutive:
-            return run, ratios, False
-
-    # A run still rising when the data ended is not a pass. Reporting PARITY for
-    # a large divergence that simply had too few steps left to satisfy the rule
-    # is the worst failure this tool could have.
-    truncated = bool(longest) and index[longest[-1]] == len(ordered) - 1
-    return [], ratios, truncated
-
-
-def compare(
-    cross_pair: tuple[Trajectory, Trajectory],
-    null_pair: tuple[Trajectory, Trajectory] | None,
-    *,
-    factor: float,
-    consecutive: int,
-    after: int,
-) -> Verdict:
-    left, right = cross_pair
-    cross = curve(left, right)
-    if not cross:
-        raise InputError(
-            f"no steps in common between {left.label} and {right.label}: "
-            f"{sorted(left.steps)[:3]}... vs {sorted(right.steps)[:3]}..."
-        )
+def summarise(
+    left: Trajectory, right: Trajectory, cross: dict[int, tuple[float, str | None]]
+) -> Report:
+    report = Report(steps_compared=len(cross))
 
     for traj in (left, right):
         if traj.nonfinite_steps:
-            step = min(traj.nonfinite_steps)
-            return Verdict(
-                diverged=True,
-                first_step=step,
-                kind="nonfinite",
-                detail=f"{traj.label} recorded a non-finite value",
-                reason=f"non-finite value in {traj.label} at step {step}",
-            )
+            report.nonfinite_step = min(traj.nonfinite_steps)
+            report.nonfinite_arm = traj.label
+            report.kind = "nonfinite"
+            report.actionable = True
+            return report
 
-    null = curve(*null_pair) if null_pair else {}
-    if null_pair and not null:
-        raise InputError("null arms share no steps; cannot build an envelope")
+    ordered = sorted(cross)
+    for step in ordered:
+        value, module = cross[step]
+        if value > 0 and report.first_divergent_step is None:
+            report.first_divergent_step = step
+            report.first_divergent_module = module
+            report.kind, report.detail = classify(left, right, step)
+            report.actionable = report.kind.endswith("desync")
+        if value > report.max_divergence:
+            report.max_divergence = value
+            report.max_divergence_step = step
+            report.max_divergence_module = module
 
-    run, ratios, truncated = find_divergence(
-        cross, null, factor=factor, consecutive=consecutive, after=after
-    )
-    if not run and truncated:
-        worst = max(ratios.items(), key=lambda kv: kv[1])
-        return Verdict(
-            diverged=False,
-            inconclusive=True,
-            first_step=worst[0],
-            kind="inconclusive",
-            reason=(
-                f"cross was still above {factor}x null at the last compared step "
-                f"(peak {worst[1]:.1f}x at step {worst[0]}) but the run ended before "
-                f"{consecutive} consecutive steps -- extend the run or lower "
-                f"--consecutive"
-            ),
-        )
-    if not run:
-        worst = max(ratios.items(), key=lambda kv: kv[1], default=(None, 0.0))
-        return Verdict(
-            diverged=False,
-            reason=(
-                f"cross stays within {factor}x the null envelope "
-                f"(peak {worst[1]:.2f}x at step {worst[0]})"
-            ),
-        )
-
-    step = run[0]
-    kind, detail = classify(left, right, step)
-    return Verdict(
-        diverged=True,
-        first_step=step,
-        module=cross[step][1],
-        kind=kind,
-        detail=detail,
-        cross_value=cross[step][0],
-        null_value=null.get(step, (0.0, None))[0],
-        reason=(
-            f"cross exceeded {factor}x null for {len(run)} consecutive compared "
-            f"steps from step {step}"
-        ),
-    )
-
-
-def _fmt(verdict: Verdict, factor: float) -> str:
-    if verdict.inconclusive:
-        return f"INCONCLUSIVE  {verdict.reason}"
-    if not verdict.diverged:
-        return f"PARITY  {verdict.reason}"
-    lines = [f"DIVERGED  {verdict.reason}", f"  first step : {verdict.first_step}"]
-    if verdict.module:
-        lines.append(f"  module     : {verdict.module}")
-    lines.append(f"  kind       : {verdict.kind}")
-    if verdict.detail:
-        lines.append(f"  detail     : {verdict.detail}")
-    if verdict.cross_value is not None:
-        ratio = verdict.cross_value / max(verdict.null_value or 0.0, NULL_FLOOR)
-        lines.append(
-            f"  cross={verdict.cross_value:.3e}  null={verdict.null_value:.3e}  "
-            f"ratio={ratio:.1f}x  (threshold {factor}x)"
-        )
-    return "\n".join(lines)
+    if ordered:
+        report.final_divergence = cross[ordered[-1]][0]
+        half = len(ordered) // 2 or 1
+        early = sum(cross[s][0] for s in ordered[:half]) / half
+        late = sum(cross[s][0] for s in ordered[-half:]) / half
+        report.growing = late > early
+    return report
 
 
 def growth_table(
     cross: dict[int, tuple[float, str | None]],
-    null: dict[int, tuple[float, str | None]],
+    reference: dict[int, tuple[float, str | None]] | None = None,
     *,
-    buckets: int = 10,
+    buckets: int = 12,
 ) -> list[dict]:
-    """Coarse divergence-growth curve, for the cumulative-instability question.
-
-    A single pass/fail hides the shape. When the answer is "does this grow", the
-    shape *is* the answer: a cross curve whose ratio to the null climbs steadily
-    says something a threshold crossing does not.
-    """
+    """Bucketed divergence curve. For cumulative instability the shape is the
+    answer, so this is the primary output rather than a decoration."""
     steps = sorted(cross)
     if not steps:
         return []
@@ -352,37 +263,60 @@ def growth_table(
     rows = []
     for start in range(0, len(steps), size):
         window = steps[start : start + size]
-        cross_mean = sum(cross[s][0] for s in window) / len(window)
-        null_values = [null[s][0] for s in window if s in null]
-        null_mean = sum(null_values) / len(null_values) if null_values else 0.0
-        rows.append(
-            {
-                "from_step": window[0],
-                "to_step": window[-1],
-                "cross": cross_mean,
-                "null": null_mean,
-                "ratio": cross_mean / max(null_mean, NULL_FLOOR),
-            }
-        )
+        row = {
+            "from_step": window[0],
+            "to_step": window[-1],
+            "cross": sum(cross[s][0] for s in window) / len(window),
+        }
+        if reference:
+            values = [reference[s][0] for s in window if s in reference]
+            row["reference"] = sum(values) / len(values) if values else None
+        rows.append(row)
     return rows
 
 
 def _fmt_growth(rows: list[dict]) -> str:
     if not rows:
-        return "no steps to chart"
-    lines = ["", "  steps            cross      null    ratio", "  " + "-" * 42]
-    peak = max(r["ratio"] for r in rows) or 1.0
+        return "  (no steps to chart)"
+    has_ref = any(r.get("reference") is not None for r in rows)
+    header = "  steps             divergence" + ("   reference" if has_ref else "")
+    lines = ["", header, "  " + "-" * (46 if has_ref else 34)]
+    peak = max(r["cross"] for r in rows) or 1.0
     for row in rows:
-        bar = "#" * max(1, round(20 * row["ratio"] / peak))
-        lines.append(
-            f"  {row['from_step']:>6}-{row['to_step']:<7} {row['cross']:.2e} "
-            f"{row['null']:.2e} {row['ratio']:7.2f}x {bar}"
+        bar = "#" * round(24 * row["cross"] / peak) if row["cross"] else ""
+        ref = ""
+        if has_ref:
+            value = row.get("reference")
+            ref = f"  {value:.2e}" if value is not None else "         -"
+        span = f"{row['from_step']:>6}-{row['to_step']:<8}"
+        lines.append(f"  {span} {row['cross']:.2e}{ref}  {bar}")
+    return "\n".join(lines)
+
+
+def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
+    if report.kind == "nonfinite":
+        return (
+            f"NON-FINITE  {report.nonfinite_arm} recorded a non-finite value at "
+            f"step {report.nonfinite_step}"
         )
-    trend = rows[-1]["ratio"] - rows[0]["ratio"]
-    lines.append(
-        f"  trend: {'rising' if trend > 0 else 'flat or falling'} "
-        f"({rows[0]['ratio']:.2f}x -> {rows[-1]['ratio']:.2f}x)"
-    )
+    if report.first_divergent_step is None:
+        return f"IDENTICAL  {report.steps_compared} steps compared, no difference"
+
+    lines = [
+        f"DIFFERS  over {report.steps_compared} compared steps",
+        f"  first difference : step {report.first_divergent_step}"
+        f"  ({report.first_divergent_module})",
+        f"  cause            : {report.kind} -- {report.detail}",
+        f"  largest          : {report.max_divergence:.3e} at step "
+        f"{report.max_divergence_step} ({report.max_divergence_module})",
+        f"  final            : {report.final_divergence:.3e}",
+        f"  trend            : {'growing' if report.growing else 'flat or shrinking'}",
+    ]
+    if report.kind == "numeric":
+        lines.append(
+            "  note             : same-seed runs share init, recycle schedule and "
+            "samples, so this is arithmetic"
+        )
     return "\n".join(lines)
 
 
@@ -398,95 +332,78 @@ def main(argv=None) -> int:
         help="the two arms to compare, e.g. the AMD and NVIDIA runs",
     )
     parser.add_argument(
-        "--null",
+        "--reference",
         nargs=2,
         metavar=("ARM_A", "ARM_B"),
-        help="two same-vendor, different-seed runs defining the noise floor. "
-        "Without it every difference is reported against a fixed floor, which "
-        "is a weaker claim -- say so if you report it.",
+        help="a second pair plotted alongside for scale. The useful one is the "
+        "same vendor with a different BLAS backend: it shows how far a "
+        "legitimate implementation swap moves the trajectory.",
     )
-    parser.add_argument("--factor", type=float, default=3.0)
-    parser.add_argument("--consecutive", type=int, default=10)
     parser.add_argument(
-        "--after", type=int, default=100, help="ignore steps below this"
+        "--fail-above",
+        type=float,
+        metavar="X",
+        help="exit 1 if the divergence exceeds X. Off by default: the magnitude "
+        "that matters is a judgement, not a constant.",
     )
-    parser.add_argument("--json", type=Path, help="write the verdict here")
-    parser.add_argument(
-        "--growth",
-        action="store_true",
-        help="print the divergence-growth curve. For cumulative instability the "
-        "shape is the answer, not the pass/fail.",
-    )
+    parser.add_argument("--after", type=int, default=0, help="ignore steps below this")
+    parser.add_argument("--json", type=Path, help="write the report here")
     parser.add_argument(
         "--watch",
         type=float,
         metavar="SECONDS",
-        help="re-read and re-report on an interval against a live run. The probe "
-        "writes line-buffered, so this works while training is in flight and "
-        "lets you stop early instead of finding out at the end.",
+        help="re-read and re-report on an interval against a live run",
     )
     args = parser.parse_args(argv)
 
-    if args.factor <= 0 or args.consecutive < 1 or args.after < 0:
-        parser.error("--factor must be > 0, --consecutive >= 1, --after >= 0")
+    if args.after < 0:
+        parser.error("--after must be >= 0")
+    if args.watch is not None and args.watch <= 0:
+        parser.error("--watch must be a positive number of seconds")
 
     def once(quiet_errors: bool) -> int | None:
-        """One comparison pass. ``None`` means retry later (watch mode only)."""
         try:
-            cross_pair = (
-                load(Path(args.cross[0]), "cross-A"),
-                load(Path(args.cross[1]), "cross-B"),
-            )
-            null_pair = (
-                (load(Path(args.null[0]), "null-A"), load(Path(args.null[1]), "null-B"))
-                if args.null
-                else None
-            )
-            verdict = compare(
-                cross_pair,
-                null_pair,
-                factor=args.factor,
-                consecutive=args.consecutive,
-                after=args.after,
-            )
+            left = load(Path(args.cross[0]), "cross-A")
+            right = load(Path(args.cross[1]), "cross-B")
+            cross = {s: v for s, v in curve(left, right).items() if s >= args.after}
+            if not cross:
+                raise InputError(
+                    f"no steps in common at or after {args.after}: "
+                    f"{sorted(left.steps)[:3]}... vs {sorted(right.steps)[:3]}..."
+                )
+            reference = None
+            if args.reference:
+                ref_left = load(Path(args.reference[0]), "ref-A")
+                ref_right = load(Path(args.reference[1]), "ref-B")
+                reference = curve(ref_left, ref_right)
         except InputError as exc:
-            # A live run may not have written enough yet; that is not an error
-            # until we stop waiting for it.
+            # A live run may not have written enough yet.
             if quiet_errors:
                 print(f"waiting: {exc}", file=sys.stderr)
                 return None
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
-        if null_pair is None:
-            print(
-                "warning: no --null arms; the envelope is a fixed floor",
-                file=sys.stderr,
-            )
-        print(_fmt(verdict, args.factor))
-        if args.growth:
-            null_curve = curve(*null_pair) if null_pair else {}
-            print(_fmt_growth(growth_table(curve(*cross_pair), null_curve)))
+        report = summarise(left, right, cross)
+        if args.fail_above is not None and report.max_divergence > args.fail_above:
+            report.actionable = True
+
+        print(_fmt(report, left, right))
+        print(_fmt_growth(growth_table(cross, reference)))
 
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps(vars(verdict), indent=2, sort_keys=True))
+            args.json.write_text(json.dumps(vars(report), indent=2, sort_keys=True))
 
-        if verdict.inconclusive:
-            return 2
-        return 1 if verdict.diverged else 0
+        return 1 if report.actionable else 0
 
     if args.watch is None:
         return once(quiet_errors=False)
 
-    if args.watch <= 0:
-        parser.error("--watch must be a positive number of seconds")
     try:
         while True:
             print(f"--- {time.strftime('%H:%M:%S')} ---")
             code = once(quiet_errors=True)
-            # Stop as soon as there is something to act on; keep waiting while
-            # the arms still agree.
             if code == 1:
                 return 1
             time.sleep(args.watch)

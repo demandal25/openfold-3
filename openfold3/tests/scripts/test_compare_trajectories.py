@@ -15,14 +15,16 @@
 """Tests for ``scripts/parity/compare_trajectories.py``.
 
 Built on synthetic trajectories so the answer is known. The pair that matters is
-:func:`test_clean_pair_is_parity` and :func:`test_injected_step_is_found` — a
-detector that has only ever been shown to stay quiet is not a detector.
+:func:`test_identical_arms_report_identical` and
+:func:`test_injected_step_is_found` — a detector that has only ever been shown
+to stay quiet is not a detector.
 """
 
 import importlib.util
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -98,6 +100,13 @@ def write_trajectory(
             emit({"kind": "loss", "step": step, "ordinal": 0, "value": 1.0})
             emit(
                 {
+                    "kind": "firings",
+                    "step": step,
+                    "counts": {m: recycles for m in MODULES},
+                }
+            )
+            emit(
+                {
                     "kind": "grad_summary",
                     "step": step,
                     "clipped": True,
@@ -121,10 +130,8 @@ def arms(tmp_path):
     }
 
 
-def _run(cross, null=None, extra=()):
+def _run(cross, extra=()):
     argv = ["--cross", str(cross[0]), str(cross[1])]
-    if null:
-        argv += ["--null", str(null[0]), str(null[1])]
     return ct.main(argv + list(extra))
 
 
@@ -133,34 +140,31 @@ def _run(cross, null=None, extra=()):
 # ---------------------------------------------------------------------------
 
 
-def test_clean_pair_is_parity(arms):
-    assert (
-        _run((arms["cross_a"], arms["cross_b"]), (arms["null_a"], arms["null_b"])) == 0
-    )
+def test_identical_arms_report_identical(tmp_path):
+    """Same seed means bit-identical, which is what we measured on MI355X."""
+    a = write_trajectory(tmp_path / "a.jsonl", seed=1, jitter=0.0)
+    b = write_trajectory(tmp_path / "b.jsonl", seed=1, jitter=0.0)
+    out = tmp_path / "r.json"
+    assert _run((a, b), extra=["--json", str(out)]) == 0
+    report = json.loads(out.read_text())
+    assert report["first_divergent_step"] is None
+    assert report["max_divergence"] == 0.0
 
 
 def test_injected_step_is_found(tmp_path, arms):
-    """Same noise as the clean pair, plus a 10x shift from step 120."""
-    bad = write_trajectory(
-        tmp_path / "bad.jsonl", seed=4, inject_at=120, inject_scale=10.0
-    )
-    out = tmp_path / "verdict.json"
-    code = _run(
-        (arms["cross_a"], bad), (arms["null_a"], arms["null_b"]), ["--json", str(out)]
-    )
-    assert code == 1
-    verdict = json.loads(out.read_text())
-    assert verdict["first_step"] == 120
-    assert verdict["kind"] == "numeric"
-    assert "blocks.1" in verdict["module"]
+    bad = write_trajectory(tmp_path / "bad.jsonl", seed=3, inject_at=120)
+    out = tmp_path / "r.json"
+    assert _run((arms["cross_a"], bad), extra=["--json", str(out)]) in (0, 1)
+    report = json.loads(out.read_text())
+    assert report["max_divergence_step"] >= 120
+    assert "blocks.1" in report["max_divergence_module"]
+    assert report["growing"] is True
 
 
-def test_a_shift_below_the_threshold_is_not_reported(tmp_path, arms):
-    """2x the null noise must not fire at the default 3x threshold."""
-    subtle = write_trajectory(
-        tmp_path / "subtle.jsonl", seed=4, inject_at=120, inject_scale=1.0000001
-    )
-    assert _run((arms["cross_a"], subtle), (arms["null_a"], arms["null_b"])) == 0
+def test_fail_above_is_off_by_default_and_works_when_set(tmp_path, arms):
+    bad = write_trajectory(tmp_path / "bad.jsonl", seed=3, inject_at=120)
+    assert _run((arms["cross_a"], bad)) == 0
+    assert _run((arms["cross_a"], bad), extra=["--fail-above", "0.1"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -168,94 +172,71 @@ def test_a_shift_below_the_threshold_is_not_reported(tmp_path, arms):
 # ---------------------------------------------------------------------------
 
 
-def test_different_samples_are_reported_as_a_data_desync(tmp_path, arms):
+def test_different_samples_are_a_data_desync(tmp_path, arms):
     other = write_trajectory(
-        tmp_path / "other.jsonl", seed=4, inject_at=120, ids=("1abc", "2def")
+        tmp_path / "o.jsonl", seed=3, inject_at=10, ids=("1abc", "2def")
     )
-    out = tmp_path / "v.json"
-    code = _run(
-        (arms["cross_a"], other), (arms["null_a"], arms["null_b"]), ["--json", str(out)]
-    )
-    assert code == 1
+    out = tmp_path / "r.json"
+    assert _run((arms["cross_a"], other), extra=["--json", str(out)]) == 1
     assert json.loads(out.read_text())["kind"] == "data-desync"
 
 
-def test_different_recycle_counts_are_reported_as_an_execution_desync(tmp_path, arms):
-    fewer = write_trajectory(
-        tmp_path / "fewer.jsonl", seed=4, inject_at=120, recycles=1
-    )
-    out = tmp_path / "v.json"
-    code = _run(
-        (arms["cross_a"], fewer), (arms["null_a"], arms["null_b"]), ["--json", str(out)]
-    )
-    assert code == 1
-    assert json.loads(out.read_text())["kind"] == "execution-desync"
+def test_different_firing_counts_are_an_execution_desync(tmp_path, arms):
+    fewer = write_trajectory(tmp_path / "f.jsonl", seed=3, inject_at=10, recycles=1)
+    out = tmp_path / "r.json"
+    assert _run((arms["cross_a"], fewer), extra=["--json", str(out)]) == 1
+    report = json.loads(out.read_text())
+    assert report["kind"] == "execution-desync"
+    assert "firing" in report["detail"] or "fired" in report["detail"]
 
 
 def test_non_finite_short_circuits_everything(tmp_path, arms):
-    blown = write_trajectory(tmp_path / "blown.jsonl", seed=4, nonfinite_at=57)
-    out = tmp_path / "v.json"
-    code = _run(
-        (arms["cross_a"], blown), (arms["null_a"], arms["null_b"]), ["--json", str(out)]
-    )
-    assert code == 1
-    verdict = json.loads(out.read_text())
-    assert verdict["kind"] == "nonfinite"
-    assert verdict["first_step"] == 57
+    blown = write_trajectory(tmp_path / "b.jsonl", seed=3, nonfinite_at=57)
+    out = tmp_path / "r.json"
+    assert _run((arms["cross_a"], blown), extra=["--json", str(out)]) == 1
+    report = json.loads(out.read_text())
+    assert report["kind"] == "nonfinite"
+    assert report["nonfinite_step"] == 57
 
 
 # ---------------------------------------------------------------------------
-# Thresholds
+# The growth curve, which is the primary output
 # ---------------------------------------------------------------------------
 
 
-def test_after_suppresses_early_steps(tmp_path, arms):
-    early = write_trajectory(tmp_path / "early.jsonl", seed=4, inject_at=5)
-    null = (arms["null_a"], arms["null_b"])
-    assert _run((arms["cross_a"], early), null, ["--after", "100"]) == 1
-
-
-def test_a_run_that_ends_mid_divergence_is_inconclusive_not_parity(tmp_path, arms):
-    """5 steps left and --consecutive 10: the rule cannot be satisfied.
-
-    Reporting PARITY here would be the worst failure this tool could have -- a
-    large, still-rising divergence read as a pass.
-    """
-    early = write_trajectory(tmp_path / "early.jsonl", seed=4, inject_at=5)
-    out = tmp_path / "v.json"
-    code = _run(
-        (arms["cross_a"], early),
-        (arms["null_a"], arms["null_b"]),
-        ["--after", "195", "--json", str(out)],
-    )
-    assert code == 2
-    verdict = json.loads(out.read_text())
-    assert verdict["inconclusive"] is True
-    assert verdict["diverged"] is False
-
-
-def test_a_long_enough_tail_still_fires(tmp_path, arms):
-    """Control for the test above: the same data with room for the rule."""
-    early = write_trajectory(tmp_path / "early2.jsonl", seed=4, inject_at=5)
-    assert (
-        _run(
-            (arms["cross_a"], early),
-            (arms["null_a"], arms["null_b"]),
-            ["--after", "150"],
-        )
-        == 1
-    )
-
-
-def test_consecutive_requires_a_sustained_run(tmp_path, arms):
-    """One spiking step is noise; the rule needs a run."""
-    spike = write_trajectory(tmp_path / "spike.jsonl", seed=4)
-    rows = [json.loads(line) for line in spike.read_text().splitlines()]
+def test_growth_curve_rises_for_a_growing_divergence(tmp_path, arms):
+    rows = [json.loads(line) for line in arms["cross_b"].read_text().splitlines()]
     for row in rows:
-        if row["kind"] == "activation" and row["step"] == 150:
-            row["mean"] *= 50
-    spike.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n")
-    assert _run((arms["cross_a"], spike), (arms["null_a"], arms["null_b"])) == 0
+        if row["kind"] == "activation":
+            row["mean"] *= 1.0 + row["step"] / 200.0
+    creeping = tmp_path / "c.jsonl"
+    creeping.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n")
+    table = ct.growth_table(
+        ct.curve(ct.load(arms["cross_a"], "a"), ct.load(creeping, "b"))
+    )
+    assert table[-1]["cross"] > table[0]["cross"]
+    assert "#" in ct._fmt_growth(table)
+
+
+def test_growth_curve_flat_for_a_clean_pair(tmp_path):
+    a = write_trajectory(tmp_path / "a.jsonl", seed=1)
+    b = write_trajectory(tmp_path / "b.jsonl", seed=2)
+    table = ct.growth_table(ct.curve(ct.load(a, "a"), ct.load(b, "b")))
+    values = [r["cross"] for r in table]
+    assert max(values) / max(min(values), 1e-12) < 10, values
+
+
+def test_reference_arm_is_charted_alongside(tmp_path, arms, capsys):
+    _run(
+        (arms["cross_a"], arms["cross_b"]),
+        extra=["--reference", str(arms["null_a"]), str(arms["null_b"])],
+    )
+    assert "reference" in capsys.readouterr().out
+
+
+def test_growth_table_is_empty_without_steps():
+    assert ct.growth_table({}) == []
+    assert "no steps" in ct._fmt_growth([])
 
 
 # ---------------------------------------------------------------------------
@@ -268,27 +249,26 @@ def test_missing_file_exits_two(tmp_path, arms):
 
 
 def test_empty_file_exits_two(tmp_path, arms):
-    empty = tmp_path / "empty.jsonl"
+    empty = tmp_path / "e.jsonl"
     empty.write_text("")
     assert _run((arms["cross_a"], empty)) == 2
 
 
 def test_mostly_garbage_exits_two(tmp_path, arms):
-    junk = tmp_path / "junk.jsonl"
+    junk = tmp_path / "j.jsonl"
     junk.write_text("\n".join("not json" for _ in range(50)))
     assert _run((arms["cross_a"], junk)) == 2
 
 
-def test_a_truncated_final_line_is_tolerated(tmp_path, arms):
-    """A run killed mid-write must still be readable."""
-    truncated = write_trajectory(tmp_path / "trunc.jsonl", seed=4)
-    text = truncated.read_text()
-    truncated.write_text(text[: len(text) - 20])
-    assert _run((arms["cross_a"], truncated), (arms["null_a"], arms["null_b"])) == 0
+def test_truncated_final_line_is_tolerated(tmp_path, arms):
+    trunc = tmp_path / "t.jsonl"
+    text = write_trajectory(trunc, seed=3).read_text()
+    trunc.write_text(text[: len(text) - 20])
+    assert _run((arms["cross_a"], trunc)) == 0
 
 
-def test_disjoint_step_ranges_exit_two(tmp_path, arms):
-    shifted = tmp_path / "shifted.jsonl"
+def test_disjoint_steps_exit_two(tmp_path, arms):
+    shifted = tmp_path / "s.jsonl"
     rows = [json.loads(line) for line in arms["cross_b"].read_text().splitlines()]
     for row in rows:
         row["step"] += 10_000
@@ -299,101 +279,43 @@ def test_disjoint_step_ranges_exit_two(tmp_path, arms):
 def test_run_directory_is_accepted(tmp_path, arms):
     run_dir = tmp_path / "run"
     write_trajectory(run_dir / "trajectory_rank0.jsonl", seed=3)
-    assert _run((run_dir, arms["cross_b"]), (arms["null_a"], arms["null_b"])) == 0
+    assert _run((run_dir, arms["cross_b"])) == 0
 
 
-def test_rejects_nonsense_thresholds(arms):
-    with pytest.raises(SystemExit):
-        _run((arms["cross_a"], arms["cross_b"]), extra=["--factor", "0"])
+def test_after_filters_steps(tmp_path, arms):
+    assert _run((arms["cross_a"], arms["cross_b"]), extra=["--after", "10000"]) == 2
 
 
-# ---------------------------------------------------------------------------
-# --growth and --watch
-# ---------------------------------------------------------------------------
-
-
-def test_growth_table_shows_a_rising_ratio(tmp_path, arms):
-    """For the cumulative question the shape is the answer, not the pass/fail."""
-    rows = [json.loads(line) for line in arms["cross_b"].read_text().splitlines()]
-    for row in rows:
-        if row["kind"] == "activation":
-            # divergence that grows with step, rather than a step change
-            row["mean"] *= 1.0 + row["step"] / 200.0
-    creeping = tmp_path / "creeping.jsonl"
-    creeping.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rows) + "\n")
-
-    cross = ct.curve(ct.load(arms["cross_a"], "a"), ct.load(creeping, "b"))
-    null = ct.curve(ct.load(arms["null_a"], "na"), ct.load(arms["null_b"], "nb"))
-    table = ct.growth_table(cross, null, buckets=5)
-
-    assert len(table) >= 5
-    assert table[-1]["ratio"] > table[0]["ratio"], "a growing divergence read as flat"
-    assert "rising" in ct._fmt_growth(table)
-
-
-def test_growth_table_on_a_clean_pair_is_flat(tmp_path, arms):
-    cross = ct.curve(ct.load(arms["cross_a"], "a"), ct.load(arms["cross_b"], "b"))
-    null = ct.curve(ct.load(arms["null_a"], "na"), ct.load(arms["null_b"], "nb"))
-    table = ct.growth_table(cross, null, buckets=5)
-    ratios = [row["ratio"] for row in table]
-    assert max(ratios) / max(min(ratios), 1e-9) < 5, (
-        f"clean pair looks like a trend: {ratios}"
-    )
-
-
-def test_growth_table_is_empty_without_shared_steps():
-    assert ct.growth_table({}, {}) == []
-    assert "no steps" in ct._fmt_growth([])
-
-
-def test_growth_flag_prints_the_table(tmp_path, arms, capsys):
-    _run(
-        (arms["cross_a"], arms["cross_b"]),
-        (arms["null_a"], arms["null_b"]),
-        ["--growth"],
-    )
-    out = capsys.readouterr().out
-    assert "ratio" in out and "trend:" in out
-
-
-def test_watch_returns_on_divergence(tmp_path, arms):
-    """Watch mode must stop as soon as there is something to act on."""
-    bad = write_trajectory(tmp_path / "bad.jsonl", seed=4, inject_at=120)
-    assert (
-        _run(
-            (arms["cross_a"], bad),
-            (arms["null_a"], arms["null_b"]),
-            ["--watch", "0.01"],
-        )
-        == 1
-    )
-
-
-def test_watch_rejects_a_non_positive_interval(arms):
+def test_rejects_bad_arguments(arms):
     with pytest.raises(SystemExit):
         _run((arms["cross_a"], arms["cross_b"]), extra=["--watch", "0"])
+    with pytest.raises(SystemExit):
+        _run((arms["cross_a"], arms["cross_b"]), extra=["--after", "-1"])
+
+
+# ---------------------------------------------------------------------------
+# --watch
+# ---------------------------------------------------------------------------
+
+
+def test_watch_returns_on_an_actionable_finding(tmp_path, arms):
+    blown = write_trajectory(tmp_path / "b.jsonl", seed=3, nonfinite_at=57)
+    assert _run((arms["cross_a"], blown), extra=["--watch", "0.01"]) == 1
 
 
 def test_watch_waits_instead_of_erroring_on_a_missing_file(tmp_path, arms, capsys):
-    """A live run may not have written anything yet; that is not an error."""
     import threading
 
     late = tmp_path / "late.jsonl"
 
     def write_later():
-        import time as _t
-
-        _t.sleep(0.4)
-        write_trajectory(late, seed=4, inject_at=120)
+        time.sleep(0.4)
+        write_trajectory(late, seed=3, nonfinite_at=57)
 
     thread = threading.Thread(target=write_later)
     thread.start()
     try:
-        code = _run(
-            (arms["cross_a"], late),
-            (arms["null_a"], arms["null_b"]),
-            ["--watch", "0.2"],
-        )
+        code = _run((arms["cross_a"], late), extra=["--watch", "0.2"])
     finally:
         thread.join()
     assert code == 1

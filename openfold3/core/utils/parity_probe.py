@@ -152,6 +152,7 @@ class ParityProbeCallback(pl.Callback):
         self._file = None
         self._ordinals: dict[str, int] = defaultdict(int)
         self._step = 0
+        self._batch_idx = 0
         self._probing = False
         #: True only between on_train_batch_start and on_train_batch_end.
         #: Without it the validation loop's forwards are recorded too, and get
@@ -198,6 +199,7 @@ class ParityProbeCallback(pl.Callback):
 
     def _emit(self, **row) -> None:
         if self._file is not None:
+            row.setdefault("batch_idx", self._batch_idx)
             self._file.write(json.dumps(row, sort_keys=True) + "\n")
 
     def _check_finite(self, stats: dict, what: str, name: str) -> None:
@@ -251,6 +253,10 @@ class ParityProbeCallback(pl.Callback):
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         self._step = int(trainer.global_step)
+        # Keyed on batch_idx too: under gradient accumulation several
+        # micro-batches share one global_step, and ordinals restart per
+        # batch, so records would overwrite each other on load.
+        self._batch_idx = int(batch_idx)
         self._ordinals.clear()
         self._probing = self._step % self.every_n_steps == 0
         self._in_train_batch = True
@@ -258,12 +264,7 @@ class ParityProbeCallback(pl.Callback):
         # from a numeric divergence when two runs disagree.
         ids = batch.get("pdb_id") if isinstance(batch, dict) else None
         if ids is not None:
-            self._emit(
-                kind="batch",
-                step=self._step,
-                batch_idx=int(batch_idx),
-                ids=[str(i) for i in ids],
-            )
+            self._emit(kind="batch", step=self._step, ids=[str(i) for i in ids])
 
     def on_before_backward(self, trainer, pl_module, loss):
         # Fires once per sample: OF3 calls manual_backward inside its own loop.

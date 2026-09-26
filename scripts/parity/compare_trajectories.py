@@ -210,6 +210,8 @@ class Report:
     growing: bool = False
     nonfinite_step: int | None = None
     nonfinite_arm: str | None = None
+    steps_left: int = 0
+    steps_right: int = 0
     actionable: bool = False
 
 
@@ -217,6 +219,8 @@ def summarise(
     left: Trajectory, right: Trajectory, cross: dict[int, tuple[float, str | None]]
 ) -> Report:
     report = Report(steps_compared=len(cross))
+    report.steps_left = len(left.steps)
+    report.steps_right = len(right.steps)
 
     for traj in (left, right):
         if traj.nonfinite_steps:
@@ -224,16 +228,32 @@ def summarise(
             report.nonfinite_arm = traj.label
             report.kind = "nonfinite"
             report.actionable = True
+            # Not left at 0.0: a consumer keying on max_divergence would
+            # otherwise read a NaN run as a clean comparison.
+            report.max_divergence = float("inf")
+            report.max_divergence_step = report.nonfinite_step
+            report.first_divergent_step = report.nonfinite_step
             return report
 
     ordered = sorted(cross)
+    # Desync is checked on every step regardless of the numbers: two arms
+    # can read different samples and still record matching stats early in
+    # training, and reporting that as IDENTICAL is the worst outcome here.
+    for step in ordered:
+        kind, detail = classify(left, right, step)
+        if kind.endswith("desync"):
+            report.kind, report.detail = kind, detail
+            report.first_divergent_step = step
+            report.first_divergent_module = cross[step][1]
+            report.actionable = True
+            break
+
     for step in ordered:
         value, module = cross[step]
         if value > 0 and report.first_divergent_step is None:
             report.first_divergent_step = step
             report.first_divergent_module = module
             report.kind, report.detail = classify(left, right, step)
-            report.actionable = report.kind.endswith("desync")
         if value > report.max_divergence:
             report.max_divergence = value
             report.max_divergence_step = step
@@ -299,8 +319,17 @@ def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
             f"NON-FINITE  {report.nonfinite_arm} recorded a non-finite value at "
             f"step {report.nonfinite_step}"
         )
+    unequal = ""
+    if report.steps_left != report.steps_right:
+        unequal = (
+            f"\n  WARNING: arms are different lengths "
+            f"({report.steps_left} vs {report.steps_right} steps); only the "
+            f"overlap was compared"
+        )
     if report.first_divergent_step is None:
-        return f"IDENTICAL  {report.steps_compared} steps compared, no difference"
+        return (
+            f"IDENTICAL  {report.steps_compared} steps compared, no difference{unequal}"
+        )
 
     lines = [
         f"DIFFERS  over {report.steps_compared} compared steps",

@@ -187,3 +187,50 @@ def test_cli_rejects_a_non_mapping_source(tmp_path):
     source = tmp_path / "list.yml"
     source.write_text("- a\n- b\n")
     assert mry.main([str(source), "--out", str(tmp_path / "o.yml"), "--seed", "1"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Review finding: the fingerprint was blind to whole config blocks
+# ---------------------------------------------------------------------------
+
+
+def test_fingerprint_catches_a_dataset_weight_difference():
+    """dataset_configs carries crop size and dataset weights, and is not the
+    same thing as dataset_paths."""
+    base_fp = mry.fingerprint(build())
+    other = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    other["dataset_configs"] = {"train": {"weighted-pdb": {"weight": 0.7}}}
+    assert mry.fingerprint(other) != base_fp
+
+
+def test_fingerprint_catches_a_crop_size_difference():
+    base = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    base["dataset_configs"] = {
+        "train": {"weighted-pdb": {"config": {"crop": {"token_budget": 384}}}}
+    }
+    other = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    other["dataset_configs"] = {
+        "train": {"weighted-pdb": {"config": {"crop": {"token_budget": 256}}}}
+    }
+    assert mry.fingerprint(base) != mry.fingerprint(other)
+
+
+def test_fingerprint_catches_a_resume_setting_difference():
+    base = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    other = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    other["experiment_settings"]["preemption_safe_resume"] = True
+    assert mry.fingerprint(base) != mry.fingerprint(other)
+
+
+def test_fingerprint_still_ignores_output_dir():
+    """Each arm writes somewhere different; that is not a mismatch."""
+    base = mry.build(BASE, seed=42, devices=8, num_workers=8)
+    other = mry.build(BASE, seed=7, devices=8, num_workers=8)
+    base["experiment_settings"]["output_dir"] = "/runs/a"
+    other["experiment_settings"]["output_dir"] = "/runs/b"
+    assert mry.fingerprint(base) == mry.fingerprint(other)
+
+
+def test_overlay_pins_gradient_accumulation():
+    """Several micro-batches per step share one global_step and collide."""
+    assert build()["pl_trainer_args"]["accumulate_grad_batches"] == 1

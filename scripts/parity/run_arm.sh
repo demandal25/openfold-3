@@ -26,11 +26,13 @@ usage() {
 usage: run_arm.sh --runner-yaml FILE --output-dir DIR --seed N [options]
 
   --runner-yaml FILE   OF3 training config (required)
-  --output-dir DIR     where to write provenance + trajectory (required)
+  --output-dir DIR     where to write provenance.json (required). The
+                       trajectory goes to the yaml's output_dir/logs/parity.
   --seed N             experiment seed (required; differs between null arms)
-  --num-workers N      dataloader workers. MUST match the other arm exactly:
-                       worker seeds are a function of worker_id (default 8)
-  --devices N          GPUs per node, must match the other arm (default 8)
+  --num-workers N      must match the runner yaml; asserted, not applied.
+                       Worker seeds are a function of worker_id (default 8)
+  --devices N          must match the runner yaml; asserted, not applied
+                       (default 8)
   --allow-dirty        proceed with uncommitted changes (records the fact)
   --dry-run            write provenance and print the command, do not launch
 
@@ -69,6 +71,31 @@ command -v run_openfold >/dev/null || {
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
+# --- the yaml is the source of truth for topology --------------------------
+# These flags used to be recorded in provenance but never passed to the run, so
+# provenance could assert devices=1 while 8 ran. They are now assertions.
+read -r YAML_DEVICES YAML_WORKERS <<<"$(python -c '
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+print((c.get("pl_trainer_args") or {}).get("devices", 1),
+      (c.get("data_module_args") or {}).get("num_workers", 0))
+' "$RUNNER_YAML")"
+
+if [[ "$YAML_DEVICES" != "$DEVICES" || "$YAML_WORKERS" != "$NUM_WORKERS" ]]; then
+    cat >&2 <<EOF
+refusing to launch: the flags disagree with the runner yaml, so provenance
+would record something the run did not do.
+
+  devices      flag=$DEVICES      yaml=$YAML_DEVICES
+  num-workers  flag=$NUM_WORKERS  yaml=$YAML_WORKERS
+
+Regenerate the yaml with make_runner_yaml.py --devices/--num-workers, or pass
+flags matching it. Both arms must agree on these: num_workers changes worker
+seeds and devices changes global batch size.
+EOF
+    exit 2
+fi
+
 # --- pins ------------------------------------------------------------------
 # Exported here so they reach the training process through the final exec. The
 # verification block below checks they arrived and that the runner yaml asks for
@@ -90,7 +117,10 @@ echo "repo root: $REPO_ROOT"
 # --- refuse to run on a tree that cannot be pinned to a commit --------------
 GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY=0
-if git rev-parse --git-dir >/dev/null 2>&1 && ! git diff --quiet HEAD 2>/dev/null; then
+# --porcelain, not `git diff HEAD`: the latter does not see untracked files,
+# so a new uncommitted module would be recorded as running at a clean SHA.
+if git rev-parse --git-dir >/dev/null 2>&1 \
+   && [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
     GIT_DIRTY=1
     if [[ "$ALLOW_DIRTY" -eq 0 ]]; then
         cat >&2 <<EOF

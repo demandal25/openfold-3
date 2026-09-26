@@ -38,6 +38,9 @@ import yaml
 OVERLAY = {
     "pl_trainer_args": {
         "deterministic": True,
+        # Pinned: several micro-batches per optimizer step complicate the
+        # trajectory keying for no benefit at batch_size 1.
+        "accumulate_grad_batches": 1,
         "precision": "bf16-mixed",
         "num_nodes": 1,
         "deepspeed_config_path": None,
@@ -77,10 +80,15 @@ OVERLAY = {
     },
 }
 
-#: The keys both arms must agree on, hashed so a mismatch is caught before the
-#: runs rather than argued about after them. Dataset paths and seed are excluded
-#: because they are the intended differences.
-FINGERPRINT_KEYS = ("pl_trainer_args", "model_update", "data_module_args")
+#: Everything except the intended per-arm differences is fingerprinted.
+#: Excluding whole top-level blocks hid real mismatches: dataset_configs
+#: carries crop size and dataset weights, which are parity-critical and are
+#: not the same thing as dataset_paths.
+FINGERPRINT_EXCLUDE_TOP = ("dataset_paths",)
+FINGERPRINT_EXCLUDE_NESTED = (
+    ("experiment_settings", "seed"),
+    ("experiment_settings", "output_dir"),
+)
 
 
 def deep_merge(base: dict, overlay: dict) -> dict:
@@ -95,7 +103,12 @@ def deep_merge(base: dict, overlay: dict) -> dict:
 
 
 def fingerprint(config: dict) -> str:
-    subset = {k: config.get(k) for k in FINGERPRINT_KEYS}
+    subset = copy.deepcopy(config)
+    for key in FINGERPRINT_EXCLUDE_TOP:
+        subset.pop(key, None)
+    for outer, inner in FINGERPRINT_EXCLUDE_NESTED:
+        if isinstance(subset.get(outer), dict):
+            subset[outer].pop(inner, None)
     return hashlib.sha256(
         json.dumps(subset, sort_keys=True, default=str).encode()
     ).hexdigest()

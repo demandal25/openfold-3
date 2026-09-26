@@ -320,3 +320,42 @@ def test_watch_waits_instead_of_erroring_on_a_missing_file(tmp_path, arms, capsy
         thread.join()
     assert code == 1
     assert "waiting:" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Review findings: each of these produced a silently wrong result
+# ---------------------------------------------------------------------------
+
+
+def test_a_desync_with_matching_stats_is_not_reported_identical(tmp_path):
+    """Two arms reading different samples must never read as IDENTICAL.
+
+    classify() used to run only at the first step whose numeric divergence was
+    non-zero, so identical recorded stats hid a full data desync.
+    """
+    a = write_trajectory(tmp_path / "a.jsonl", seed=1, jitter=0.0, ids=("7ohe",))
+    b = write_trajectory(tmp_path / "b.jsonl", seed=1, jitter=0.0, ids=("1abc",))
+    out = tmp_path / "r.json"
+    code = _run((a, b), extra=["--json", str(out)])
+    report = json.loads(out.read_text())
+    assert report["max_divergence"] == 0.0, "stats must be identical for this test"
+    assert report["kind"] == "data-desync"
+    assert code == 1
+
+
+def test_non_finite_is_not_zero_divergence_in_the_json(tmp_path, arms):
+    """A consumer keying on max_divergence must not read a NaN run as clean."""
+    blown = write_trajectory(tmp_path / "b.jsonl", seed=3, nonfinite_at=57)
+    out = tmp_path / "r.json"
+    assert _run((arms["cross_a"], blown), extra=["--json", str(out)]) == 1
+    report = json.loads(out.read_text())
+    assert report["max_divergence"] == float("inf")
+    assert report["first_divergent_step"] == 57
+
+
+def test_unequal_arm_lengths_are_flagged(tmp_path, arms, capsys):
+    """An arm that died early must not read as parity over the overlap."""
+    short = write_trajectory(tmp_path / "s.jsonl", seed=3, steps=12, jitter=0.0)
+    full = write_trajectory(tmp_path / "f.jsonl", seed=3, steps=200, jitter=0.0)
+    _run((short, full))
+    assert "different lengths" in capsys.readouterr().out

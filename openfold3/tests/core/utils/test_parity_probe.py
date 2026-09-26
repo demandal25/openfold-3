@@ -31,6 +31,8 @@ from openfold3.core.utils.parity_probe import (
     DEFAULT_MODULE_PATTERNS,
     NonFiniteValue,
     ParityProbeCallback,
+    _stats,
+    check_patterns_match,
 )
 
 
@@ -210,8 +212,77 @@ def test_unmatched_patterns_warn_but_still_record_gradients(tmp_path, caplog):
     assert any("no module matched" in r.message for r in caplog.records)
 
 
-def test_default_patterns_are_valid_regexes():
-    import re
+@pytest.mark.parametrize(
+    "tensor_factory",
+    [
+        pytest.param(lambda: torch.randn(1000) * 3 + 2, id="plain"),
+        pytest.param(lambda: torch.tensor([4.25]), id="single-element"),
+        pytest.param(
+            lambda: torch.cat([torch.randn(100), torch.tensor([float("nan")])]),
+            id="with-nan",
+        ),
+        pytest.param(lambda: (torch.randn(1000) * 3).bfloat16(), id="bf16"),
+    ],
+)
+def test_stats_matches_a_masked_reference(tensor_factory):
+    """The packed single-sync reduction must agree with plain masked torch ops."""
+    torch.manual_seed(0)
+    tensor = tensor_factory()
+    stats = _stats(tensor)
 
-    for pattern in DEFAULT_MODULE_PATTERNS:
-        re.compile(pattern)
+    flat = tensor.detach().float().reshape(-1)
+    good = flat[torch.isfinite(flat)]
+    assert stats["mean"] == pytest.approx(float(good.mean()), abs=2e-4)
+    assert stats["std"] == pytest.approx(
+        float(good.std()) if good.numel() > 1 else 0.0, abs=2e-4
+    )
+    assert stats["absmax"] == pytest.approx(float(good.abs().max()), abs=2e-4)
+    assert stats["nonfinite"] == int((~torch.isfinite(flat)).sum())
+
+
+def test_stats_returns_none_for_integer_tensors():
+    assert _stats(torch.arange(10)) is None
+
+
+def test_stats_reports_an_all_non_finite_tensor_without_moments():
+    stats = _stats(torch.full((10,), float("nan")))
+    assert stats["nonfinite"] == 10
+    assert "mean" not in stats
+
+
+# ---------------------------------------------------------------------------
+# The patterns must match the model they are written for
+# ---------------------------------------------------------------------------
+
+
+def test_default_patterns_match_the_real_model():
+    """Guards against silent no-match, which costs one warning and all the data.
+
+    ``msa_module_stack`` did not exist; the module is ``msa_module``.
+    """
+    from openfold3.projects.of3_all_atom.project_entry import OF3ProjectEntry
+    from openfold3.projects.of3_all_atom.runner import OpenFold3AllAtom
+
+    config = OF3ProjectEntry().get_model_config_with_presets()
+    config.architecture.pairformer.no_blocks = 3
+    config.architecture.diffusion_module.diffusion_transformer.no_blocks = 3
+    model = OpenFold3AllAtom(config)
+
+    counts = check_patterns_match(model, DEFAULT_MODULE_PATTERNS)
+    unmatched = [p for p, n in counts.items() if n == 0]
+    assert not unmatched, f"patterns match nothing: {unmatched}"
+
+
+def test_trunk_and_confidence_head_stacks_are_not_conflated():
+    """``aux_heads.pairformer_embedding`` has its own separately-sized stack."""
+    from openfold3.projects.of3_all_atom.project_entry import OF3ProjectEntry
+    from openfold3.projects.of3_all_atom.runner import OpenFold3AllAtom
+
+    config = OF3ProjectEntry().get_model_config_with_presets()
+    config.architecture.pairformer.no_blocks = 3
+    model = OpenFold3AllAtom(config)
+
+    trunk = check_patterns_match(model, [r"^model\.pairformer_stack\.blocks\.\d+$"])
+    assert next(iter(trunk.values())) == 3, (
+        "trunk pattern is picking up another stack's blocks"
+    )

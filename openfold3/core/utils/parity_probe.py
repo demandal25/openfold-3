@@ -46,15 +46,29 @@ import torch
 logger = logging.getLogger(__name__)
 
 #: Modules worth watching by default: the trunk stacks where instability shows
-#: up first, plus the diffusion path. Matched with ``re.search`` against the
-#: dotted module name.
+#: up first, plus the diffusion path and the confidence head's own stack.
+#:
+#: Anchored deliberately. ``pairformer_stack\.blocks\.\d+$`` alone also matches
+#: ``aux_heads.pairformer_embedding.pairformer_stack``, which is a separate stack
+#: with its own depth, so an unanchored pattern conflates the trunk with the
+#: confidence head. :func:`check_patterns_match` guards the names against drift.
 DEFAULT_MODULE_PATTERNS = (
-    r"pairformer_stack\.blocks\.\d+$",
-    r"msa_module_stack\.blocks\.\d+$",
-    r"template_embedder$",
-    r"diffusion_module$",
-    r"diffusion_transformer\.blocks\.\d+$",
+    r"^model\.pairformer_stack\.blocks\.\d+$",
+    r"^model\.msa_module\.blocks\.\d+$",
+    r"^model\.template_embedder\.template_pair_stack\.blocks\.\d+$",
+    r"^model\.diffusion_module\.diffusion_transformer\.blocks\.\d+$",
+    r"^model\.aux_heads\.pairformer_embedding\.pairformer_stack\.blocks\.\d+$",
 )
+
+
+def check_patterns_match(module: torch.nn.Module, patterns) -> dict[str, int]:
+    """Return per-pattern match counts against ``module.named_modules()``.
+
+    A pattern that matches nothing is the failure mode this exists to catch: the
+    probe would log one warning and then record no activations at all.
+    """
+    names = [name for name, _ in module.named_modules()]
+    return {p: sum(bool(re.search(p, n)) for n in names) for p in patterns}
 
 
 class NonFiniteValue(RuntimeError):
@@ -64,22 +78,40 @@ class NonFiniteValue(RuntimeError):
 def _stats(tensor: torch.Tensor) -> dict | None:
     """Cheap summary of a tensor; ``None`` for non-float tensors.
 
-    Reduced in fp32 so bf16 sums do not saturate.
+    Reduced in fp32 so bf16 sums do not saturate, and stacked into one tensor so
+    the whole summary costs a single host sync rather than four — the probe runs
+    on ~80 modules per recycle.
     """
     if not torch.is_floating_point(tensor):
         return None
     flat = tensor.detach().float().reshape(-1)
     finite = torch.isfinite(flat)
-    n_bad = int((~finite).sum())
-    if n_bad == flat.numel():
-        return {"shape": list(tensor.shape), "nonfinite": n_bad}
-    good = flat[finite]
+    n_finite = finite.sum()
+    # Non-finite entries are zeroed rather than indexed out: boolean masking
+    # would force a host sync of its own to size the result.
+    safe = torch.where(finite, flat, torch.zeros_like(flat))
+    count = n_finite.clamp(min=1)
+    mean = safe.sum() / count
+    var = ((safe - mean) * finite).pow(2).sum() / (count - 1).clamp(min=1)
+    packed = torch.stack(
+        [
+            mean,
+            var.sqrt(),
+            safe.abs().max(),
+            (flat.numel() - n_finite).float(),
+            n_finite.float(),
+        ]
+    ).tolist()
+
+    shape = list(tensor.shape)
+    if packed[4] == 0:  # everything was non-finite; the moments are meaningless
+        return {"shape": shape, "nonfinite": int(packed[3])}
     return {
-        "shape": list(tensor.shape),
-        "mean": float(good.mean()),
-        "std": float(good.std()) if good.numel() > 1 else 0.0,
-        "absmax": float(good.abs().max()),
-        "nonfinite": n_bad,
+        "shape": shape,
+        "mean": packed[0],
+        "std": packed[1],
+        "absmax": packed[2],
+        "nonfinite": int(packed[3]),
     }
 
 

@@ -247,8 +247,11 @@ PY
     done
 
     say "Determinism check"
+    # --fail-above 0: without it a purely numeric divergence still exits 0,
+    # and this gate exists to catch exactly that.
     "$bin/python" "$REPO_ROOT/scripts/parity/compare_trajectories.py" \
-        --cross "$SCRATCH/v1/logs/parity" "$SCRATCH/v2/logs/parity"
+        --cross "$SCRATCH/v1/logs/parity" "$SCRATCH/v2/logs/parity" \
+        --fail-above 0
     local verdict=$?
 
     say "Verdict"

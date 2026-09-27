@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dropout rate validation.
-
-Routing the mask through vendor_rng dropped the internal nn.Dropout, and with it
-construction-time validation of the rate. A bad rate would otherwise surface on
-the first training forward, after config load, checkpoint load and DDP setup --
-or never, on an eval-only path.
-"""
+"""Dropout rate validation, at construction rather than at the first forward."""
 
 import pytest
 

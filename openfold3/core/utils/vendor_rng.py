@@ -35,7 +35,14 @@ def enabled() -> bool:
     """Whether draws are routed through the CPU."""
     global _enabled
     if _enabled is None:
-        _enabled = os.environ.get(_ENV_VAR, "0") not in ("", "0", "false", "False")
+        # Allow-list, so every other spelling -- "no", "off", "disabled" --
+        # leaves the default device-RNG path alone.
+        _enabled = os.environ.get(_ENV_VAR, "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
     return _enabled
 
 

@@ -64,9 +64,18 @@ def parity_disabled():
         ("1", True),
         ("true", True),
         ("yes", True),
+        ("on", True),
+        ("YES", True),
+        ("  1  ", True),
         ("0", False),
         ("false", False),
         ("", False),
+        # An allow-list, so every other spelling of "off" stays off. A deny-list
+        # read each of these as enabled and silently rerouted every draw to CPU.
+        ("no", False),
+        ("off", False),
+        ("FALSE", False),
+        ("disabled", False),
     ],
 )
 def test_enabled_reads_the_environment(monkeypatch, value, expected):

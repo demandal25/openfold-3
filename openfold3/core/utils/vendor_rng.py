@@ -103,8 +103,10 @@ def randn_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
     if not enabled():
         return torch.randn_like(tensor, **kwargs)
     dtype = kwargs.pop("dtype", tensor.dtype)
+    # Popped, not forwarded: torch.randn already has device="cpu" here.
+    device = kwargs.pop("device", None) or tensor.device
     out = torch.randn(tensor.shape, device="cpu", dtype=dtype, **kwargs)
-    return out.to(tensor.device)
+    return out.to(_device_of(device))
 
 
 def rand_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -112,8 +114,9 @@ def rand_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
     if not enabled():
         return torch.rand_like(tensor, **kwargs)
     dtype = kwargs.pop("dtype", tensor.dtype)
+    device = kwargs.pop("device", None) or tensor.device
     out = torch.rand(tensor.shape, device="cpu", dtype=dtype, **kwargs)
-    return out.to(tensor.device)
+    return out.to(_device_of(device))
 
 
 def dropout_mask(shape, p: float, *, device=None, dtype=None) -> torch.Tensor:

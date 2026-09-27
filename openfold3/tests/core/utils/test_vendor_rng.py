@@ -237,3 +237,11 @@ def test_randn_honours_dtype(parity_enabled):
         vendor_rng.randn_like(torch.zeros(8, dtype=torch.bfloat16)).dtype
         == torch.bfloat16
     )
+
+
+@pytest.mark.parametrize("fn", ["randn_like", "rand_like"])
+def test_like_wrappers_accept_an_explicit_device(parity_enabled, fn):
+    """torch.*_like takes device=; forwarding it collided with the CPU draw."""
+    out = getattr(vendor_rng, fn)(torch.zeros(4, 3), device="cpu")
+    assert out.shape == (4, 3)
+    assert out.device.type == "cpu"

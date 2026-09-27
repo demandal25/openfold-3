@@ -55,6 +55,9 @@ OVERLAY = {
                     "abort_on_nonfinite": True,
                 },
                 "debug": {"log_grad_norm": True, "log_extra_grad_metrics": True},
+                # The trainer arg above is forced to 1 under per-sample
+                # clipping (on by default); this is the knob that then applies.
+                "manual_optimization": {"accumulate_grad_batches": 1},
                 "memory": {
                     "train": {
                         "use_deepspeed_evo_attention": False,

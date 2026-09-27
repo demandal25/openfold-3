@@ -81,8 +81,14 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 read -r YAML_DEVICES YAML_WORKERS <<<"$(python -c '
 import sys, yaml
 c = yaml.safe_load(open(sys.argv[1])) or {}
-print((c.get("pl_trainer_args") or {}).get("devices", 1),
-      (c.get("data_module_args") or {}).get("num_workers", 0))
+devices = (c.get("pl_trainer_args") or {}).get("devices", "<unset>")
+if isinstance(devices, (list, tuple)):
+    devices = len(devices)
+elif isinstance(devices, bool) or not isinstance(devices, int):
+    # "auto"/-1 resolve at runtime, so the arm cannot be pinned to a topology.
+    devices = "<unpinned:%s>" % devices
+workers = (c.get("data_module_args") or {}).get("num_workers", "<unset>")
+print(devices, workers)
 ' "$RUNNER_YAML")"
 
 if [[ "$YAML_DEVICES" != "$DEVICES" || "$YAML_WORKERS" != "$NUM_WORKERS" ]]; then
@@ -265,6 +271,14 @@ VENDOR_KERNEL_FLAGS = (
     "use_triton_triangle_kernels",
     "use_lma",
 )
+manual = (settings or {}).get("manual_optimization", {}) or {}
+accum = manual.get("accumulate_grad_batches", 1)
+if accum != 1:
+    failures.append(
+        f"settings.manual_optimization.accumulate_grad_batches is {accum}; "
+        f"several micro-batches per optimizer step break the trajectory keying"
+    )
+
 memory = (settings or {}).get("memory", {}) or {}
 for phase in ("train", "eval"):
     flags = memory.get(phase, {}) or {}

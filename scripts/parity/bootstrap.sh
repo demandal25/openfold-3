@@ -17,7 +17,10 @@
 #
 #   bootstrap.sh probe     what is here: GPUs, ROCm, scheduler, fabric, disk
 #   bootstrap.sh install   build the environment and fetch the subset dataset
-#   bootstrap.sh verify    two same-seed arms; they must come back IDENTICAL
+#   bootstrap.sh verify [N]  two same-seed arms on N devices (default 1);
+#                            they must come back IDENTICAL. The verdict only
+#                            covers the topology and precision it ran at, so
+#                            pass the arm's device count before relying on it.
 #
 # `probe` is read-only and safe to run first. Nothing else assumes a scheduler,
 # a shared filesystem, or a pre-built environment -- those are discovered.
@@ -201,6 +204,10 @@ cmd_install() {
 # ---------------------------------------------------------------------------
 
 cmd_verify() {
+    # Defaults to one device for a quick gate; pass the real arm topology to
+    # make the verdict cover it. Precision is never overridden -- a machine
+    # deterministic in fp32 can still be non-deterministic in bf16.
+    local devices="${1:-1}"
     local bin="$REPO_ROOT/.pixi/envs/openfold3-rocm7/bin"
     [[ -x "$bin/python" ]] || { echo "environment missing; run install first" >&2; exit 2; }
     export PATH="$bin:$PATH"
@@ -215,15 +222,15 @@ cmd_verify() {
 
     say "Building two identical arms"
     "$bin/python" "$REPO_ROOT/scripts/parity/make_runner_yaml.py" \
-        "$src" --out "$SCRATCH/verify.yml" --seed 42 --devices 1 --num-workers 2 || exit 2
+        "$src" --out "$SCRATCH/verify.yml" --seed 42 --devices "$devices" \
+        --num-workers 2 || exit 2
     "$bin/python" - "$SCRATCH" <<'PY' || exit 2
 import sys, yaml
 scratch = sys.argv[1]
 cfg = yaml.safe_load(open(f"{scratch}/verify.yml"))
 cfg["data_module_args"]["epoch_len"] = 4
 cfg["pl_trainer_args"].update(
-    {"max_epochs": 1, "precision": "32-true",
-     "limit_val_batches": 0, "num_sanity_val_steps": 0}
+    {"max_epochs": 1, "limit_val_batches": 0, "num_sanity_val_steps": 0}
 )
 for name in ("v1", "v2"):
     cfg["experiment_settings"]["output_dir"] = f"{scratch}/{name}"
@@ -235,7 +242,7 @@ PY
         say "Arm $arm"
         "$REPO_ROOT/scripts/parity/run_arm.sh" \
             --runner-yaml "$SCRATCH/$arm.yml" --output-dir "$SCRATCH/${arm}_prov" \
-            --seed 42 --devices 1 --num-workers 2 --allow-dirty \
+            --seed 42 --devices "$devices" --num-workers 2 --allow-dirty \
             > "$SCRATCH/$arm.log" 2>&1
         local code=$?
         if [[ $code -ne 0 ]]; then
@@ -258,11 +265,22 @@ PY
     local gpu
     gpu="$("$bin/python" -c 'import torch; print(torch.cuda.get_device_name(0))' \
         2>/dev/null || echo "unknown GPU")"
-    if [[ $verdict -eq 0 ]]; then
+    local precision
+    precision="$("$bin/python" -c \
+        'import sys,yaml; print((yaml.safe_load(open(sys.argv[1])) or {})["pl_trainer_args"]["precision"])' \
+        "$SCRATCH/v1.yml" 2>/dev/null || echo unknown)"
+    if [[ $verdict -eq 2 ]]; then
+        cat <<'EOF'
+  INCONCLUSIVE -- the trajectories could not be compared at all (missing,
+  truncated, or no steps in common). This is not a determinism result. Check
+  the arm logs above before drawing any conclusion.
+EOF
+    elif [[ $verdict -eq 0 ]]; then
         cat <<EOF
-  IDENTICAL -- $gpu is bit-deterministic under the harness. Cross-vendor
-  differences measured here are arithmetic, not noise, and need no statistical
-  envelope. This verdict covers $gpu only.
+  IDENTICAL -- $gpu is bit-deterministic at precision=$precision on $devices
+  device(s). Cross-vendor differences measured under the same settings are
+  arithmetic, not noise. The verdict covers this GPU, precision and device
+  count only -- rerun with the arm topology before relying on it.
 EOF
     else
         cat <<'EOF'
@@ -281,6 +299,6 @@ EOF
 case "${1:-}" in
     probe)   cmd_probe ;;
     install) cmd_install ;;
-    verify)  cmd_verify ;;
+    verify)  shift; cmd_verify "$@" ;;
     *) sed -n '16,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

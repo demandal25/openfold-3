@@ -79,8 +79,9 @@ def load(path: Path, label: str) -> Trajectory:
     seen_firings: dict[int, int] = {}
     # Streamed, not read_text(): a long run's trajectory is hundreds of MB
     # and --watch re-reads it every interval.
-    handle = path.open()
-    for lineno, line in enumerate(handle, 1):
+    with path.open() as handle:
+        rows = list(enumerate(handle, 1))
+    for lineno, line in rows:
         line = line.strip()
         if not line:
             continue
@@ -123,7 +124,6 @@ def load(path: Path, label: str) -> Trajectory:
                 k: v for k, v in row.items() if k not in ("kind", "step", "batch_idx")
             }
 
-    handle.close()
     if not traj.steps:
         raise InputError(f"{path}: no comparable records")
     return traj
@@ -176,6 +176,14 @@ def step_divergence(
                 diff = rel_diff(lhs[key][name], rhs[key][name])
                 if diff > worst:
                     worst, culprit = diff, f"{key[1]}[{key[2]}].{name}"
+
+    ll, rl = left.losses.get(step, []), right.losses.get(step, [])
+    # The cheapest scalar signal, and recorded on every step even when
+    # activations are thinned by every_n_steps.
+    for index, (lv, rv) in enumerate(zip(ll, rl)):
+        diff = rel_diff(lv, rv)
+        if diff > worst:
+            worst, culprit = diff, f"loss[{index}]"
 
     lg, rg = left.grad_summary.get(step), right.grad_summary.get(step)
     if lg and rg:

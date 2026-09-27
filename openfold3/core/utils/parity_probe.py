@@ -32,13 +32,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-#: Modules worth watching by default: the trunk stacks where instability shows
-#: up first, plus the diffusion path and the confidence head's own stack.
-#:
-#: Anchored deliberately. ``pairformer_stack\.blocks\.\d+$`` alone also matches
-#: ``aux_heads.pairformer_embedding.pairformer_stack``, which is a separate stack
-#: with its own depth, so an unanchored pattern conflates the trunk with the
-#: confidence head. :func:`check_patterns_match` guards the names against drift.
+#: Trunk stacks where instability shows up first, plus the diffusion path and
+#: the confidence head's own stack. Anchored: an unanchored pairformer pattern
+#: also matches the confidence head's separate stack.
 DEFAULT_MODULE_PATTERNS = (
     r"^model\.pairformer_stack\.blocks\.\d+$",
     r"^model\.msa_module\.blocks\.\d+$",
@@ -72,6 +68,9 @@ def _stats(tensor: torch.Tensor) -> dict | None:
     if not torch.is_floating_point(tensor):
         return None
     flat = tensor.detach().float().reshape(-1)
+    # max() on an empty tensor raises, and a probe must not kill the run.
+    if flat.numel() == 0:
+        return {"shape": list(tensor.shape), "nonfinite": 0}
     finite = torch.isfinite(flat)
     n_finite = finite.sum()
     # Non-finite entries are zeroed rather than indexed out: boolean masking
@@ -135,10 +134,8 @@ class ParityProbeCallback(pl.Callback):
         self._batch_idx = 0
         self._probing = False
         self._warned_no_grads = False
-        #: True only between on_train_batch_start and on_train_batch_end.
-        #: Without it the validation loop's forwards are recorded too, and get
-        #: attributed to the preceding training step -- measured at ~20x the
-        #: real firing count on the 4-structure validation set.
+        #: True only between on_train_batch_start and on_train_batch_end;
+        #: otherwise validation forwards land on the preceding training step.
         self._in_train_batch = False
 
     # -- lifecycle ---------------------------------------------------------

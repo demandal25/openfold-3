@@ -99,6 +99,12 @@ def _by_kind(rows, kind):
 # ---------------------------------------------------------------------------
 
 
+def test_stats_survives_an_empty_tensor():
+    """A zero-length activation must not take the run down from inside a hook."""
+    stats = _stats(torch.empty(0, 4))
+    assert stats == {"shape": [0, 4], "nonfinite": 0}
+
+
 def test_records_activations_losses_and_gradients(tmp_path):
     torch.manual_seed(0)
     _run(tmp_path)

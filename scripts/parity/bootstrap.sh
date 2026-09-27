@@ -209,6 +209,10 @@ cmd_verify() {
     local src="$REPO_ROOT/datasets/train_pdb_subset.yaml"
     [[ -f "$src" ]] || { echo "no subset config at $src; run install first" >&2; exit 2; }
 
+    # The probe refuses to append to an existing trajectory, so a second
+    # verify would die looking like a training failure. Named literally.
+    rm -rf "$SCRATCH/v1" "$SCRATCH/v2" "$SCRATCH/v1_prov" "$SCRATCH/v2_prov"
+
     say "Building two identical arms"
     "$bin/python" "$REPO_ROOT/scripts/parity/make_runner_yaml.py" \
         "$src" --out "$SCRATCH/verify.yml" --seed 42 --devices 1 --num-workers 2 || exit 2
@@ -248,11 +252,14 @@ PY
     local verdict=$?
 
     say "Verdict"
+    local gpu
+    gpu="$("$bin/python" -c 'import torch; print(torch.cuda.get_device_name(0))' \
+        2>/dev/null || echo "unknown GPU")"
     if [[ $verdict -eq 0 ]]; then
-        cat <<'EOF'
-  IDENTICAL -- this machine is bit-deterministic under the harness, matching
-  the MI355X reference. Cross-vendor differences measured here are arithmetic,
-  not noise, and need no statistical envelope.
+        cat <<EOF
+  IDENTICAL -- $gpu is bit-deterministic under the harness. Cross-vendor
+  differences measured here are arithmetic, not noise, and need no statistical
+  envelope. This verdict covers $gpu only.
 EOF
     else
         cat <<'EOF'

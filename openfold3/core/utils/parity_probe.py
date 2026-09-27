@@ -22,6 +22,7 @@ so the ordinal is what keeps two runs aligned.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import re
 from collections import defaultdict
@@ -73,8 +74,7 @@ def _stats(tensor: torch.Tensor) -> dict | None:
         return {"shape": list(tensor.shape), "nonfinite": 0}
     finite = torch.isfinite(flat)
     n_finite = finite.sum()
-    # Non-finite entries are zeroed rather than indexed out: boolean masking
-    # would force a host sync of its own to size the result.
+    # Zeroed rather than masked out; masking would cost a sync of its own.
     safe = torch.where(finite, flat, torch.zeros_like(flat))
     count = n_finite.clamp(min=1)
     mean = safe.sum() / count
@@ -136,6 +136,9 @@ class ParityProbeCallback(pl.Callback):
         self._warned_no_grads = False
         self._warned_no_ids = False
         self._nonfinite_detail: str | None = None
+        #: Device-side OR of "this firing had a non-finite value", folded in
+        #: at the batch boundary so capped firings are still covered.
+        self._nonfinite_flag: torch.Tensor | None = None
         #: OF3 only disables automatic optimization under per-sample
         #: clipping; otherwise gradients are unclipped at this hook.
         self._manual_optimization = False
@@ -210,9 +213,22 @@ class ParityProbeCallback(pl.Callback):
     # -- recording ---------------------------------------------------------
 
     def _emit(self, **row) -> None:
-        if self._file is not None:
-            row.setdefault("batch_idx", self._batch_idx)
-            self._file.write(json.dumps(row, sort_keys=True) + "\n")
+        if self._file is None:
+            return
+        row.setdefault("batch_idx", self._batch_idx)
+        # Non-finite floats become null: json.dumps would write a bare
+        # Infinity/NaN token, which only Python's reader accepts.
+        blown = sorted(
+            k
+            for k, v in row.items()
+            if isinstance(v, float) and not math.isfinite(v)
+        )
+        if blown:
+            row = {
+                k: (None if k in blown else v) for k, v in row.items()
+            }
+            row["nonfinite_fields"] = blown
+        self._file.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
 
     def _check_finite(self, stats: dict, what: str, name: str) -> None:
         if not stats.get("nonfinite", 0):
@@ -225,33 +241,46 @@ class ParityProbeCallback(pl.Callback):
             self._step,
         )
         if self.abort_on_nonfinite and self._nonfinite_detail is None:
-            # Recorded, not raised: under DDP a raise here leaves the other
-            # ranks in the next allreduce until the watchdog fires. The batch
-            # boundary is the first place every rank can agree to stop.
+            # Recorded, not raised: a raise here hangs the other DDP ranks.
+            # The batch boundary is where they can agree to stop.
             self._nonfinite_detail = (
                 f"{stats['nonfinite']} non-finite values in {what} of {name!r} "
                 f"at step {self._step}; trace in {self.output_dir}"
             )
+
+    def _note_nonfinite(self, tensor: torch.Tensor) -> None:
+        """Record a possible non-finite value without a host sync."""
+        if not (self.abort_on_nonfinite and torch.is_floating_point(tensor)):
+            return
+        bad = (~torch.isfinite(tensor.detach())).any()
+        if self._nonfinite_flag is None:
+            self._nonfinite_flag = bad
+        else:
+            self._nonfinite_flag = self._nonfinite_flag | bad
 
     def _abort_if_nonfinite(self, pl_module) -> None:
         """Stop all ranks together when any of them saw a non-finite value."""
         if not self.abort_on_nonfinite:
             return
         detail = self._nonfinite_detail
+        local = self._nonfinite_flag
+        device = local.device if local is not None else pl_module.device
+        flag = torch.tensor(
+            [1.0 if detail else 0.0], device=device, dtype=torch.float32
+        )
+        if local is not None:
+            flag = flag + local.to(device=device, dtype=torch.float32)
+        self._nonfinite_flag = None
         if dist.is_available() and dist.is_initialized():
-            flag = torch.tensor(
-                [1.0 if detail else 0.0], device=pl_module.device
-            )
             dist.all_reduce(flag, op=dist.ReduceOp.SUM)
-            hit = bool(flag.item())
-        else:
-            hit = detail is not None
-        if not hit:
+        if not bool(flag.item()):
             return
         if self._file is not None:
             self._file.flush()
         raise NonFiniteValue(
-            detail or "another rank recorded a non-finite value; see its log"
+            detail
+            or "a non-finite value was seen past the firing cap, or on "
+            "another rank; see the logs of every rank"
         )
 
     def _make_hook(self, name: str):
@@ -265,10 +294,13 @@ class ParityProbeCallback(pl.Callback):
             # Still counted, not recorded: the onset of a divergence is in the
             # first firings, not the last. Before _stats, which costs a sync.
             capped = self.max_firings_per_module
-            if capped and ordinal >= capped:
-                return
             tensor = output[0] if isinstance(output, tuple) else output
             if not isinstance(tensor, torch.Tensor):
+                return
+            if capped and ordinal >= capped:
+                # Suppressed from the record, not from the tripwire.
+                # Device-side, so it costs no sync.
+                self._note_nonfinite(tensor)
                 return
             stats = _stats(tensor)
             if stats is None:
@@ -362,9 +394,10 @@ class ParityProbeCallback(pl.Callback):
             n_params=len(named_grads),
         )
 
-        # Per-parameter detail only when probing, or when the summary says
-        # something went non-finite and we need to name the parameter.
-        if self._probing or n_bad:
+        # Only when the summary says something went non-finite. Written every
+        # step they were the bulk of the file and no consumer read them; the
+        # one thing they answer is which parameter blew up.
+        if n_bad:
             for name, grad in named_grads:
                 stats = _stats(grad)
                 if stats is None:

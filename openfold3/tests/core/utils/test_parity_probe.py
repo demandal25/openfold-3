@@ -413,3 +413,43 @@ def test_rows_carry_batch_idx_so_accumulation_cannot_collide(tmp_path):
     _run(tmp_path, steps=2)
     rows = _rows(tmp_path)
     assert all("batch_idx" in r for r in rows), "a row is missing batch_idx"
+
+
+def test_a_non_finite_past_the_firing_cap_still_aborts(tmp_path):
+    """A capped firing is still checked: it is never written, so only the
+    device-side flag can see a non-finite value there."""
+    probe = ParityProbeCallback(output_dir=tmp_path, max_firings_per_module=1)
+    probe._probing = True
+    probe._in_train_batch = True
+    hook = probe._make_hook("blocks.0")
+
+    hook(None, None, torch.ones(4))  # ordinal 0, recorded, finite
+    assert probe._nonfinite_flag is None
+    hook(None, None, torch.full((4,), float("inf")))  # ordinal 1, capped
+    assert probe._nonfinite_flag is not None
+    assert bool(probe._nonfinite_flag)
+
+    module = torch.nn.Linear(2, 2)
+    with pytest.raises(NonFiniteValue):
+        probe._abort_if_nonfinite(module)
+
+
+def test_every_trajectory_row_is_strict_json(tmp_path):
+    """Python's json.loads accepts bare Infinity/NaN; nothing else does."""
+    try:
+        _run(tmp_path, steps=3, blow_up_at=1, abort_on_nonfinite=False)
+    except NonFiniteValue:  # pragma: no cover - abort is off
+        pass
+
+    def _reject(token):
+        raise AssertionError(f"non-JSON constant in trajectory: {token}")
+
+    decoder = json.JSONDecoder(parse_constant=_reject)
+    path = tmp_path / "trajectory_rank0.jsonl"
+    rows = [decoder.decode(line) for line in path.read_text().splitlines()]
+    assert rows
+    blown = [r for r in rows if r.get("nonfinite_fields")]
+    assert blown, "expected at least one row to have carried a non-finite float"
+    for row in blown:
+        for field in row["nonfinite_fields"]:
+            assert row[field] is None

@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +62,8 @@ class NonFiniteValue(RuntimeError):
 def _stats(tensor: torch.Tensor) -> dict | None:
     """Cheap summary of a tensor; ``None`` for non-float tensors.
 
-    Reduced in fp32 so bf16 sums do not saturate, and stacked into one tensor so
-    the whole summary costs a single host sync rather than four — the probe runs
-    on ~80 modules per recycle.
+    Reduced in fp32 so bf16 sums do not saturate, and stacked so the summary
+    costs one host sync rather than four.
     """
     if not torch.is_floating_point(tensor):
         return None
@@ -135,6 +135,10 @@ class ParityProbeCallback(pl.Callback):
         self._probing = False
         self._warned_no_grads = False
         self._warned_no_ids = False
+        self._nonfinite_detail: str | None = None
+        #: OF3 only disables automatic optimization under per-sample
+        #: clipping; otherwise gradients are unclipped at this hook.
+        self._manual_optimization = False
         #: True only between on_train_batch_start and on_train_batch_end;
         #: otherwise validation forwards land on the preceding training step.
         self._in_train_batch = False
@@ -154,6 +158,7 @@ class ParityProbeCallback(pl.Callback):
             )
         # Line-buffered, so a run killed by a hang still leaves a usable trace.
         self._file = path.open("w", buffering=1)
+        self._manual_optimization = not pl_module.automatic_optimization
         self._register_hooks(pl_module)
         logger.info(
             "ParityProbe: %d modules matched, writing %s", len(self._handles), path
@@ -219,13 +224,35 @@ class ParityProbeCallback(pl.Callback):
             name,
             self._step,
         )
-        if self.abort_on_nonfinite:
-            if self._file is not None:
-                self._file.flush()
-            raise NonFiniteValue(
+        if self.abort_on_nonfinite and self._nonfinite_detail is None:
+            # Recorded, not raised: under DDP a raise here leaves the other
+            # ranks in the next allreduce until the watchdog fires. The batch
+            # boundary is the first place every rank can agree to stop.
+            self._nonfinite_detail = (
                 f"{stats['nonfinite']} non-finite values in {what} of {name!r} "
                 f"at step {self._step}; trace in {self.output_dir}"
             )
+
+    def _abort_if_nonfinite(self, pl_module) -> None:
+        """Stop all ranks together when any of them saw a non-finite value."""
+        if not self.abort_on_nonfinite:
+            return
+        detail = self._nonfinite_detail
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor(
+                [1.0 if detail else 0.0], device=pl_module.device
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.SUM)
+            hit = bool(flag.item())
+        else:
+            hit = detail is not None
+        if not hit:
+            return
+        if self._file is not None:
+            self._file.flush()
+        raise NonFiniteValue(
+            detail or "another rank recorded a non-finite value; see its log"
+        )
 
     def _make_hook(self, name: str):
         def hook(_module, _inputs, output):
@@ -235,10 +262,8 @@ class ParityProbeCallback(pl.Callback):
             # spot an execution desync, so it must not skip odd outputs.
             ordinal = self._ordinals[name]
             self._ordinals[name] = ordinal + 1
-            # Beyond the cap the module is still counted but not recorded: the
-            # diffusion transformer fires ~842x per step under rollout, and the
-            # onset of a divergence is in the first few, not the last. Checked
-            # before _stats, which costs a host sync.
+            # Still counted, not recorded: the onset of a divergence is in the
+            # first firings, not the last. Before _stats, which costs a sync.
             capped = self.max_firings_per_module
             if capped and ordinal >= capped:
                 return
@@ -330,7 +355,7 @@ class ParityProbeCallback(pl.Callback):
         self._emit(
             kind="grad_summary",
             step=self._step,
-            clipped=True,
+            clipped=self._manual_optimization,
             total_norm=float(total_sq) ** 0.5,
             absmax=float(max_abs),
             nonfinite=n_bad,
@@ -345,7 +370,11 @@ class ParityProbeCallback(pl.Callback):
                 if stats is None:
                     continue
                 self._emit(
-                    kind="grad", step=self._step, param=name, clipped=True, **stats
+                    kind="grad",
+                    step=self._step,
+                    param=name,
+                    clipped=self._manual_optimization,
+                    **stats,
                 )
                 self._check_finite(stats, "gradient", name)
 
@@ -359,3 +388,4 @@ class ParityProbeCallback(pl.Callback):
             self._emit(kind="firings", step=self._step, counts=firings)
         if self._file is not None:
             self._file.flush()
+        self._abort_if_nonfinite(pl_module)

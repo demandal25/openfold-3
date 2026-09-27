@@ -22,13 +22,16 @@
 set -euo pipefail
 
 usage() {
+    local code="${1:-2}"
     cat >&2 <<'USAGE'
 usage: run_arm.sh --runner-yaml FILE --output-dir DIR --seed N [options]
 
   --runner-yaml FILE   OF3 training config (required)
   --output-dir DIR     where to write provenance.json (required). The
                        trajectory goes to the yaml's output_dir/logs/parity.
-  --seed N             experiment seed (required; differs between null arms)
+  --seed N             experiment seed (required; must match the runner yaml).
+                       Both arms of a comparison use the same seed -- the
+                       reference pair varies OF3_BLAS_LIBRARY, not this
   --num-workers N      must match the runner yaml; asserted, not applied.
                        Worker seeds are a function of worker_id (default 8)
   --devices N          must match the runner yaml; asserted, not applied
@@ -40,7 +43,7 @@ Pins applied and recorded: vendor-independent RNG, PYTHONHASHSEED, cuBLAS
 workspace, MIOpen find mode, inductor threads. Asserted from the yaml:
 deterministic algorithms, precision, probe on, vendor kernels off.
 USAGE
-    exit 2
+    exit "$code"
 }
 
 RUNNER_YAML="" OUTPUT_DIR="" SEED="" NUM_WORKERS=8 DEVICES=8
@@ -55,7 +58,7 @@ while [[ $# -gt 0 ]]; do
         --devices)     DEVICES="${2:?}";     shift 2 ;;
         --allow-dirty) ALLOW_DIRTY=1;        shift ;;
         --dry-run)     DRY_RUN=1;            shift ;;
-        -h|--help)     usage ;;
+        -h|--help)     usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done

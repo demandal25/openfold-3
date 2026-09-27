@@ -91,6 +91,8 @@ FINGERPRINT_EXCLUDE_TOP = ("dataset_paths",)
 FINGERPRINT_EXCLUDE_NESTED = (
     ("experiment_settings", "seed"),
     ("experiment_settings", "output_dir"),
+    # Where the console log goes says nothing about what the arm computes.
+    ("experiment_settings", "log_dir"),
 )
 
 
@@ -113,7 +115,7 @@ def fingerprint(config: dict) -> str:
         if isinstance(subset.get(outer), dict):
             subset[outer].pop(inner, None)
     return hashlib.sha256(
-        json.dumps(subset, sort_keys=True, default=str).encode()
+        json.dumps(subset, sort_keys=True, allow_nan=False).encode()
     ).hexdigest()
 
 

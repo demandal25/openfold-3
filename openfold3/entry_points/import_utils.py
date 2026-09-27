@@ -45,16 +45,19 @@ def _configure_torch_backend():
 
     # Empty means unset: `export OF3_BLAS_LIBRARY=` must not abort the run.
     library = (os.environ.get("OF3_BLAS_LIBRARY") or "").strip().lower() or None
-    if library is not None and library not in (
-        "cublas",
-        "cublaslt",
-        "hipblaslt",
-    ):
+    # torch's own set; "ck" is the ROCm alternative this knob exists to try.
+    known = ("default", "cublas", "hipblas", "cublaslt", "hipblaslt", "ck")
+    if library is not None and library not in known:
         raise ValueError(
-            f"OF3_BLAS_LIBRARY={library!r} is not one of cublas, cublaslt, hipblaslt"
+            f"OF3_BLAS_LIBRARY={library!r} is not one of {', '.join(known)}"
         )
     if not torch.cuda.is_available():
         return
+    if library is not None and torch.version.hip is None and library.startswith("hip"):
+        raise ValueError(
+            f"OF3_BLAS_LIBRARY={library!r} is a ROCm backend but this is a CUDA "
+            f"build; use cublas or cublaslt on the NVIDIA leg"
+        )
     if torch.version.hip is not None:
         # Force the cuBLAS backend on AMD/ROCm to match the numerics of
         # NVIDIA-trained models.

@@ -452,7 +452,7 @@ class TrainingExperimentRunner(ExperimentRunner):
 
             # Disable the `LearningRateMonitor` callback, logging is handled
             # manually in the training step
-            if self.logging_config.log_lr and self.use_wandb:
+            if self.logging_config.log_lr:
                 self.model_config.update(
                     {"settings": {"manual_optimization": {"log_lr": True}}}
                 )

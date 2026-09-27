@@ -53,6 +53,7 @@ class Trajectory:
     batch_ids: dict[int, list[str]] = field(default_factory=dict)
     losses: dict[int, list[float]] = field(default_factory=dict)
     firings: dict[int, dict[str, int]] = field(default_factory=dict)
+    probe_config: dict = field(default_factory=dict)
     nonfinite_steps: list[int] = field(default_factory=list)
 
     @property
@@ -109,6 +110,10 @@ def load(path: Path, label: str) -> Trajectory:
             traj.losses.setdefault(step, []).append(float(row["value"]))
         elif kind == "firings":
             traj.firings[step] = dict(row.get("counts", {}))
+        elif kind == "probe_config":
+            traj.probe_config = {
+                k: v for k, v in row.items() if k not in ("kind", "step", "batch_idx")
+            }
 
     if not traj.steps:
         raise InputError(f"{path}: no comparable records")
@@ -234,6 +239,8 @@ class Report:
     steps_left: int = 0
     steps_right: int = 0
     actionable: bool = False
+    #: Set when the two arms cannot be compared on equal terms.
+    caveats: list[str] = field(default_factory=list)
 
 
 def summarise(
@@ -243,18 +250,38 @@ def summarise(
     report.steps_left = len(left.steps)
     report.steps_right = len(right.steps)
 
-    for traj in (left, right):
-        if traj.nonfinite_steps:
-            report.nonfinite_step = min(traj.nonfinite_steps)
-            report.nonfinite_arm = traj.label
-            report.kind = "nonfinite"
+    # Settings that change what got recorded. Two arms capped differently
+    # compare only on the intersection, which looks more similar than it is.
+    for key in ("every_n_steps", "max_firings_per_module", "patterns"):
+        lv, rv = left.probe_config.get(key), right.probe_config.get(key)
+        if lv != rv:
+            report.caveats.append(f"probe {key} differs: {lv!r} vs {rv!r}")
             report.actionable = True
-            # Not left at 0.0: a consumer keying on max_divergence would
-            # otherwise read a NaN run as a clean comparison.
-            report.max_divergence = float("inf")
-            report.max_divergence_step = report.nonfinite_step
-            report.first_divergent_step = report.nonfinite_step
-            return report
+    if not (left.batch_ids or right.batch_ids):
+        report.caveats.append(
+            "no sample identity recorded (dataset has no pdb_id): a data "
+            "desync would be reported as a numeric difference"
+        )
+
+    onsets = [
+        (min(traj.nonfinite_steps), traj.label)
+        for traj in (left, right)
+        if traj.nonfinite_steps
+    ]
+    if onsets:
+        # Earliest across both arms: the leftmost arm is not necessarily the
+        # one that blew up first, and the gap can be hundreds of steps.
+        step, label = min(onsets)
+        report.nonfinite_step = step
+        report.nonfinite_arm = label
+        report.kind = "nonfinite"
+        report.actionable = True
+        # Not left at 0.0: a consumer keying on max_divergence would
+        # otherwise read a NaN run as a clean comparison.
+        report.max_divergence = float("inf")
+        report.max_divergence_step = report.nonfinite_step
+        report.first_divergent_step = report.nonfinite_step
+        return report
 
     ordered = sorted(cross)
     # Desync is checked on every step regardless of the numbers: two arms
@@ -322,9 +349,16 @@ def _fmt_growth(rows: list[dict]) -> str:
     has_ref = any(r.get("reference") is not None for r in rows)
     header = "  steps             divergence" + ("   reference" if has_ref else "")
     lines = ["", header, "  " + "-" * (46 if has_ref else 34)]
-    peak = max(r["cross"] for r in rows) or 1.0
+    finite = [r["cross"] for r in rows if math.isfinite(r["cross"])]
+    # inf would make round(inf/inf) raise and lose the whole table.
+    peak = (max(finite) if finite else 0.0) or 1.0
     for row in rows:
-        bar = "#" * round(24 * row["cross"] / peak) if row["cross"] else ""
+        if not math.isfinite(row["cross"]):
+            bar = "non-finite"
+        elif row["cross"]:
+            bar = "#" * min(24, round(24 * row["cross"] / peak))
+        else:
+            bar = ""
         ref = ""
         if has_ref:
             value = row.get("reference")
@@ -335,10 +369,11 @@ def _fmt_growth(rows: list[dict]) -> str:
 
 
 def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
+    caveats = "".join(f"\nCAVEAT      {c}" for c in report.caveats)
     if report.kind == "nonfinite":
         return (
             f"NON-FINITE  {report.nonfinite_arm} recorded a non-finite value at "
-            f"step {report.nonfinite_step}"
+            f"step {report.nonfinite_step}{caveats}"
         )
     unequal = ""
     if report.steps_left != report.steps_right:
@@ -349,7 +384,8 @@ def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
         )
     if report.first_divergent_step is None:
         return (
-            f"IDENTICAL  {report.steps_compared} steps compared, no difference{unequal}"
+            f"IDENTICAL  {report.steps_compared} steps compared, "
+            f"no difference{unequal}{caveats}"
         )
 
     lines = [
@@ -367,7 +403,8 @@ def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
             "  note             : same-seed runs share init, recycle schedule and "
             "samples, so this is arithmetic"
         )
-    return "\n".join(lines)
+    lines.extend(f"  CAVEAT           : {c}" for c in report.caveats)
+    return "\n".join(lines) + unequal
 
 
 def main(argv=None) -> int:

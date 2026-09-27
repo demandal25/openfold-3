@@ -409,3 +409,53 @@ def test_unequal_arm_lengths_are_flagged(tmp_path, arms, capsys):
     full = write_trajectory(tmp_path / "f.jsonl", seed=3, steps=200, jitter=0.0)
     _run((short, full))
     assert "different lengths" in capsys.readouterr().out
+
+
+def test_non_finite_names_the_arm_that_blew_up_first(tmp_path):
+    """The leftmost arm is not necessarily the earliest; the gap can be huge."""
+    late = write_trajectory(tmp_path / "late.jsonl", seed=3, nonfinite_at=180)
+    early = write_trajectory(tmp_path / "early.jsonl", seed=3, nonfinite_at=12)
+    out = tmp_path / "r.json"
+    assert _run((late, early), extra=["--json", str(out)]) == 1
+    report = json.loads(out.read_text())
+    assert report["nonfinite_step"] == 12
+    assert report["nonfinite_arm"] == "cross-B"
+
+
+def test_growth_table_survives_an_infinite_bucket(tmp_path, capsys):
+    """round(inf/inf) raised and lost the whole report after the header."""
+    rows = [
+        {"from_step": 0, "to_step": 7, "cross": 1e-7, "reference": None},
+        {"from_step": 8, "to_step": 15, "cross": float("inf"), "reference": None},
+    ]
+    text = ct._fmt_growth(rows)
+    assert "non-finite" in text
+    assert "1.00e-07" in text
+
+
+def _write_with_probe_config(path: Path, cap: int) -> Path:
+    write_trajectory(path, seed=1, jitter=0.0, steps=20)
+    with path.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "kind": "probe_config",
+                    "step": -1,
+                    "batch_idx": 0,
+                    "every_n_steps": 1,
+                    "max_firings_per_module": cap,
+                    "patterns": ["^model\\."],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    return path
+
+
+def test_mismatched_probe_settings_are_flagged(tmp_path, capsys):
+    """Different caps compare on the intersection and look falsely similar."""
+    a = _write_with_probe_config(tmp_path / "a.jsonl", cap=16)
+    b = _write_with_probe_config(tmp_path / "b.jsonl", cap=32)
+    assert _run((a, b)) == 1
+    assert "max_firings_per_module differs" in capsys.readouterr().out

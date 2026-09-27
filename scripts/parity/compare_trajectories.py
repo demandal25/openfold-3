@@ -76,13 +76,23 @@ def load(path: Path, label: str) -> Trajectory:
     bad_lines = 0
     seen_grad: dict[int, int] = {}
     seen_batch: dict[int, int] = {}
-    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+    seen_firings: dict[int, int] = {}
+    # Streamed, not read_text(): a long run's trajectory is hundreds of MB
+    # and --watch re-reads it every interval.
+    handle = path.open()
+    for lineno, line in enumerate(handle, 1):
         line = line.strip()
         if not line:
             continue
         try:
             row = json.loads(line)
             kind, step = row["kind"], int(row["step"])
+            batch_idx = int(row.get("batch_idx", 0))
+            key = (
+                (batch_idx, row["module"], int(row["ordinal"]))
+                if kind == "activation"
+                else None
+            )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             # A run killed mid-write leaves a truncated final line; tolerate a
             # few, but a file that is mostly garbage is not a trajectory.
@@ -95,11 +105,8 @@ def load(path: Path, label: str) -> Trajectory:
 
         if row.get("nonfinite"):
             traj.nonfinite_steps.append(step)
-        batch_idx = int(row.get("batch_idx", 0))
         if kind == "activation":
-            traj.activations.setdefault(step, {})[
-                (batch_idx, row["module"], int(row["ordinal"]))
-            ] = row
+            traj.activations.setdefault(step, {})[key] = row
         elif kind == "grad_summary":
             _reject_accumulation(seen_grad, step, batch_idx, path)
             traj.grad_summary[step] = row
@@ -109,12 +116,14 @@ def load(path: Path, label: str) -> Trajectory:
         elif kind == "loss":
             traj.losses.setdefault(step, []).append(float(row["value"]))
         elif kind == "firings":
+            _reject_accumulation(seen_firings, step, batch_idx, path)
             traj.firings[step] = dict(row.get("counts", {}))
         elif kind == "probe_config":
             traj.probe_config = {
                 k: v for k, v in row.items() if k not in ("kind", "step", "batch_idx")
             }
 
+    handle.close()
     if not traj.steps:
         raise InputError(f"{path}: no comparable records")
     return traj
@@ -142,6 +151,8 @@ def _json_safe(value):
         return None
     if isinstance(value, dict):
         return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
     return value
 
 
@@ -257,10 +268,15 @@ def summarise(
         if lv != rv:
             report.caveats.append(f"probe {key} differs: {lv!r} vs {rv!r}")
             report.actionable = True
-    if not (left.batch_ids or right.batch_ids):
+    if not (left.batch_ids and right.batch_ids):
+        which = (
+            "neither arm"
+            if not (left.batch_ids or right.batch_ids)
+            else f"only {left.label if left.batch_ids else right.label}"
+        )
         report.caveats.append(
-            "no sample identity recorded (dataset has no pdb_id): a data "
-            "desync would be reported as a numeric difference"
+            f"sample identity recorded by {which} (no pdb_id): a data desync "
+            f"would be reported as a numeric difference"
         )
 
     onsets = [
@@ -368,7 +384,7 @@ def _fmt_growth(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _fmt(report: Report, left: Trajectory, right: Trajectory) -> str:
+def _fmt(report: Report) -> str:
     caveats = "".join(f"\nCAVEAT      {c}" for c in report.caveats)
     if report.kind == "nonfinite":
         return (
@@ -475,7 +491,7 @@ def main(argv=None) -> int:
         if args.fail_above is not None and report.max_divergence > args.fail_above:
             report.actionable = True
 
-        print(_fmt(report, left, right))
+        print(_fmt(report))
         print(_fmt_growth(growth_table(cross, reference)))
 
         if args.json:

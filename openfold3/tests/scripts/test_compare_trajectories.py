@@ -459,3 +459,68 @@ def test_mismatched_probe_settings_are_flagged(tmp_path, capsys):
     b = _write_with_probe_config(tmp_path / "b.jsonl", cap=32)
     assert _run((a, b)) == 1
     assert "max_firings_per_module differs" in capsys.readouterr().out
+
+
+def test_a_malformed_activation_row_is_unusable_input_not_a_finding(tmp_path, capsys):
+    """Exit 1 means "actionable divergence"; a corrupt file must not claim one."""
+    good = write_trajectory(tmp_path / "a.jsonl", seed=1, jitter=0.0, steps=20)
+    broken = tmp_path / "b.jsonl"
+    write_trajectory(broken, seed=1, jitter=0.0, steps=20)
+    with broken.open("a") as handle:
+        for _ in range(12):
+            handle.write(json.dumps({"kind": "activation", "step": 1}) + "\n")
+    assert _run((good, broken)) == 2
+
+
+def test_identity_on_only_one_arm_is_flagged(tmp_path, capsys):
+    """A desync is undetectable when one arm never recorded sample identity."""
+    with_ids = write_trajectory(tmp_path / "a.jsonl", seed=1, jitter=0.0, steps=20)
+    without = tmp_path / "b.jsonl"
+    kept = [
+        line
+        for line in write_trajectory(tmp_path / "raw.jsonl", seed=1, jitter=0.0, steps=20)
+        .read_text()
+        .splitlines()
+        if json.loads(line)["kind"] != "batch"
+    ]
+    without.write_text("\n".join(kept) + "\n")
+    _run((with_ids, without))
+    assert "sample identity recorded by only" in capsys.readouterr().out
+
+
+def test_firings_under_accumulation_are_refused(tmp_path, capsys):
+    """Firings collided on step the same way activations did."""
+    paths = []
+    for name in ("a.jsonl", "b.jsonl"):
+        path = tmp_path / name
+        with path.open("w") as handle:
+            for step in range(6):
+                for batch_idx in range(2):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "kind": "firings",
+                                "step": step,
+                                "batch_idx": batch_idx,
+                                "counts": {"m": batch_idx + 1},
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                handle.write(
+                    json.dumps(
+                        {
+                            "kind": "grad_summary",
+                            "step": step,
+                            "batch_idx": 0,
+                            "total_norm": 1.0,
+                            "absmax": 1.0,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+        paths.append(path)
+    assert _run(tuple(paths)) == 2
+    assert "gradient accumulation" in capsys.readouterr().err

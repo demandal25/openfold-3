@@ -240,8 +240,17 @@ def test_randn_honours_dtype(parity_enabled):
 
 
 @pytest.mark.parametrize("fn", ["randn_like", "rand_like"])
-def test_like_wrappers_accept_an_explicit_device(parity_enabled, fn):
-    """torch.*_like takes device=; forwarding it collided with the CPU draw."""
-    out = getattr(vendor_rng, fn)(torch.zeros(4, 3), device="cpu")
+@pytest.mark.parametrize("device", ["cpu", 0, None])
+def test_like_wrappers_accept_an_explicit_device(parity_enabled, fn, device):
+    """torch.*_like takes device=, including the falsy-but-valid index 0.
+
+    ``device=0`` is cuda:0 in torch, so `or` would have silently sent it to the
+    source tensor's device instead.
+    """
+    if device == 0 and not torch.cuda.is_available():
+        pytest.skip("device index 0 needs a GPU")
+    kwargs = {} if device is None else {"device": device}
+    out = getattr(vendor_rng, fn)(torch.zeros(4, 3), **kwargs)
     assert out.shape == (4, 3)
-    assert out.device.type == "cpu"
+    expected = torch.zeros(1).device if device is None else torch.device(device)
+    assert out.device == torch.empty(0, device=expected).device

@@ -104,7 +104,9 @@ def randn_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
         return torch.randn_like(tensor, **kwargs)
     dtype = kwargs.pop("dtype", tensor.dtype)
     # Popped, not forwarded: torch.randn already has device="cpu" here.
-    device = kwargs.pop("device", None) or tensor.device
+    # Sentinel, not `or`: device=0 is falsy but a valid index.
+    device = kwargs.pop("device", None)
+    device = tensor.device if device is None else device
     out = torch.randn(tensor.shape, device="cpu", dtype=dtype, **kwargs)
     return out.to(_device_of(device))
 
@@ -114,7 +116,8 @@ def rand_like(tensor: torch.Tensor, **kwargs) -> torch.Tensor:
     if not enabled():
         return torch.rand_like(tensor, **kwargs)
     dtype = kwargs.pop("dtype", tensor.dtype)
-    device = kwargs.pop("device", None) or tensor.device
+    device = kwargs.pop("device", None)
+    device = tensor.device if device is None else device
     out = torch.rand(tensor.shape, device="cpu", dtype=dtype, **kwargs)
     return out.to(_device_of(device))
 

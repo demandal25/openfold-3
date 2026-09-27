@@ -78,7 +78,7 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 # --- the yaml is the source of truth for topology --------------------------
 # These flags used to be recorded in provenance but never passed to the run, so
 # provenance could assert devices=1 while 8 ran. They are now assertions.
-read -r YAML_DEVICES YAML_WORKERS <<<"$(python -c '
+read -r YAML_DEVICES YAML_WORKERS YAML_SEED YAML_NODES <<<"$(python -c '
 import sys, yaml
 c = yaml.safe_load(open(sys.argv[1])) or {}
 devices = (c.get("pl_trainer_args") or {}).get("devices", "<unset>")
@@ -88,8 +88,21 @@ elif isinstance(devices, bool) or not isinstance(devices, int):
     # "auto"/-1 resolve at runtime, so the arm cannot be pinned to a topology.
     devices = "<unpinned:%s>" % devices
 workers = (c.get("data_module_args") or {}).get("num_workers", "<unset>")
-print(devices, workers)
+seed = (c.get("experiment_settings") or {}).get("seed", "<unset>")
+nodes = (c.get("pl_trainer_args") or {}).get("num_nodes", 1)
+print(devices, workers, seed, nodes)
 ' "$RUNNER_YAML")"
+
+# run_openfold overwrites experiment_settings.seed with --seed, so a mismatch
+# makes provenance and the parity fingerprint describe a seed nothing ran.
+if [[ "$YAML_SEED" != "$SEED" ]]; then
+    cat >&2 <<EOF
+refusing to launch: --seed $SEED disagrees with the runner yaml's
+experiment_settings.seed=$YAML_SEED. run_openfold would use $SEED while
+provenance and the parity fingerprint record $YAML_SEED.
+EOF
+    exit 2
+fi
 
 if [[ "$YAML_DEVICES" != "$DEVICES" || "$YAML_WORKERS" != "$NUM_WORKERS" ]]; then
     cat >&2 <<EOF
@@ -156,6 +169,17 @@ import torch
 
 import openfold3
 
+def fingerprint_of(path):
+    """The config fingerprint both arms must agree on, taken from what runs."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    try:
+        import yaml
+        from make_runner_yaml import fingerprint
+        return fingerprint(yaml.safe_load(open(path)) or {})
+    except Exception as exc:  # never block a run on the bookkeeping
+        return f"<unavailable: {exc}>"
+
+
 def run(*cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
@@ -170,7 +194,10 @@ record = {
     "git": {"sha": sha, "dirty": bool(int(dirty))},
     "runner_yaml": {
         "path": os.path.abspath(yaml_path),
+        # sha256 differs between arms by design (output_dir); the fingerprint
+        # is the cross-arm check and is recomputed here, after any edit.
         "sha256": hashlib.sha256(open(yaml_path, "rb").read()).hexdigest(),
+        "parity_fingerprint": fingerprint_of(yaml_path),
     },
     "vendor": "amd" if is_rocm else "nvidia",
     "blas_backend": str(torch.backends.cuda.preferred_blas_library()),
@@ -308,7 +335,12 @@ PY
 # neither SLURM nor explicit rendezvous variables, a num_nodes > 1 run has no
 # mechanism to form one: it hangs, or silently runs as N independent
 # single-node jobs. Refuse rather than produce either.
-NUM_NODES_CFG="$(python -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])) or {}; print((c.get("pl_trainer_args") or {}).get("num_nodes",1))' "$RUNNER_YAML")"
+NUM_NODES_CFG="$YAML_NODES"
+if [[ ! "$NUM_NODES_CFG" =~ ^[0-9]+$ ]]; then
+    echo "pl_trainer_args.num_nodes is '$NUM_NODES_CFG', not an integer; the arm" >&2
+    echo "cannot be pinned to a topology" >&2
+    exit 2
+fi
 if [[ "$NUM_NODES_CFG" -gt 1 ]]; then
     if [[ -n "${SLURM_JOB_ID:-}" ]]; then
         echo "multi-node: $NUM_NODES_CFG nodes via SLURM job ${SLURM_JOB_ID}"

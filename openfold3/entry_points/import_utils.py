@@ -43,8 +43,9 @@ def _configure_torch_backend():
 
     import torch
 
-    library = os.environ.get("OF3_BLAS_LIBRARY")
-    if library is not None and library.lower() not in (
+    # Empty means unset: `export OF3_BLAS_LIBRARY=` must not abort the run.
+    library = (os.environ.get("OF3_BLAS_LIBRARY") or "").strip().lower() or None
+    if library is not None and library not in (
         "cublas",
         "cublaslt",
         "hipblaslt",

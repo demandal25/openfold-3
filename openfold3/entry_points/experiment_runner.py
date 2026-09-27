@@ -592,17 +592,25 @@ class TrainingExperimentRunner(ExperimentRunner):
         log_filepath = self.log_dir / "console_logs.log"
         logging.basicConfig(filename=log_filepath, level=log_level, filemode="w")
 
+    @property
+    def _parity_probe_enabled(self) -> bool:
+        """Whether the cross-vendor trajectory probe is switched on."""
+        probe = self.model_config.settings.get("parity_probe")
+        return probe is not None and bool(probe.enabled)
+
     @cached_property
     def loggers(self):
         """Retrieve the list of loggers to be used in the experiment.
 
-        Falls back to a CSV logger when W&B is not configured: every metric site
-        is guarded on `self.logger is not None`, so with an empty list a run
-        silently records nothing -- including the per-step gradient metrics.
+        A CSV logger stands in for W&B only under the parity probe, whose
+        metric sites are all guarded on ``self.logger is not None``. Other
+        runs keep the empty list they had.
         """
         if self.use_wandb:
             return [self.wandb.logger]
-        return [CSVLogger(save_dir=self.log_dir, name="", version="")]
+        if self._parity_probe_enabled:
+            return [CSVLogger(save_dir=self.log_dir, name="", version="")]
+        return []
 
     @cached_property
     def callbacks(self):
@@ -614,18 +622,20 @@ class TrainingExperimentRunner(ExperimentRunner):
         _checkpoint = self.checkpoint_config
         if _checkpoint is not None:
             _ckpt_args = _checkpoint.model_dump()
-            # Pinned, because ModelCheckpoint otherwise resolves dirpath
-            # from loggers[0].save_dir: adding the CSV logger would move
-            # checkpoints to <output_dir>/logs/checkpoints and orphan
-            # anything a resume expects at the old path.
-            _ckpt_args.setdefault("dirpath", self.output_dir / "checkpoints")
+            if self._parity_probe_enabled and not self.use_wandb:
+                # ModelCheckpoint resolves dirpath from loggers[0].save_dir,
+                # so the CSV logger would move checkpoints under logs/ and
+                # orphan whatever a resume expects at the old path.
+                _ckpt_args.setdefault(
+                    "dirpath", self.output_dir / "checkpoints"
+                )
             _callbacks.append(ModelCheckpoint(**_ckpt_args))
 
         if self.model_config.settings.debug.log_iteration_time:
             _callbacks.append(PredictTimer(output_dir=None))
 
-        _parity = self.model_config.settings.get("parity_probe")
-        if _parity is not None and _parity.enabled:
+        if self._parity_probe_enabled:
+            _parity = self.model_config.settings.parity_probe
             _callbacks.append(
                 ParityProbeCallback(
                     output_dir=self.log_dir / "parity",
@@ -635,7 +645,7 @@ class TrainingExperimentRunner(ExperimentRunner):
             )
 
         _log_lr = self.logging_config.log_lr
-        if _log_lr and self.use_wandb:
+        if _log_lr and self.loggers:
             _callbacks.append(LearningRateMonitor(logging_interval="step"))
 
         return _callbacks

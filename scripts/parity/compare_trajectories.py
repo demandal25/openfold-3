@@ -45,8 +45,10 @@ class Trajectory:
     """One arm's records, indexed for comparison."""
 
     label: str
-    #: step -> (module, ordinal) -> row
-    activations: dict[int, dict[tuple[str, int], dict]] = field(default_factory=dict)
+    #: step -> (batch_idx, module, ordinal) -> row
+    activations: dict[int, dict[tuple[int, str, int], dict]] = field(
+        default_factory=dict
+    )
     grad_summary: dict[int, dict] = field(default_factory=dict)
     batch_ids: dict[int, list[str]] = field(default_factory=dict)
     losses: dict[int, list[float]] = field(default_factory=dict)
@@ -71,6 +73,8 @@ def load(path: Path, label: str) -> Trajectory:
 
     traj = Trajectory(label=label)
     bad_lines = 0
+    seen_grad: dict[int, int] = {}
+    seen_batch: dict[int, int] = {}
     for lineno, line in enumerate(path.read_text().splitlines(), 1):
         line = line.strip()
         if not line:
@@ -90,13 +94,16 @@ def load(path: Path, label: str) -> Trajectory:
 
         if row.get("nonfinite"):
             traj.nonfinite_steps.append(step)
+        batch_idx = int(row.get("batch_idx", 0))
         if kind == "activation":
             traj.activations.setdefault(step, {})[
-                (row["module"], int(row["ordinal"]))
+                (batch_idx, row["module"], int(row["ordinal"]))
             ] = row
         elif kind == "grad_summary":
+            _reject_accumulation(seen_grad, step, batch_idx, path)
             traj.grad_summary[step] = row
         elif kind == "batch":
+            _reject_accumulation(seen_batch, step, batch_idx, path)
             traj.batch_ids[step] = [str(i) for i in row.get("ids", [])]
         elif kind == "loss":
             traj.losses.setdefault(step, []).append(float(row["value"]))
@@ -106,6 +113,31 @@ def load(path: Path, label: str) -> Trajectory:
     if not traj.steps:
         raise InputError(f"{path}: no comparable records")
     return traj
+
+
+def _reject_accumulation(seen: dict, step: int, batch_idx: int, path) -> None:
+    """Refuse a trajectory whose steps hold more than one micro-batch.
+
+    One record per step is kept, so accumulation would silently discard every
+    micro-batch but the last -- including a divergence in the ones dropped.
+    """
+    previous = seen.setdefault(step, batch_idx)
+    if previous != batch_idx:
+        raise InputError(
+            f"{path}: step {step} carries batch_idx {previous} and {batch_idx}, "
+            f"so the run used gradient accumulation. This comparison keys one "
+            f"record per step and would keep only the last micro-batch."
+        )
+
+
+def _json_safe(value):
+    """Replace non-finite floats with None; ``json.dumps`` emits bare
+    ``Infinity``/``NaN``, which no strict JSON reader accepts."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
 
 
 def rel_diff(a: float, b: float) -> float:
@@ -127,7 +159,7 @@ def step_divergence(
             if name in lhs[key] and name in rhs[key]:
                 diff = rel_diff(lhs[key][name], rhs[key][name])
                 if diff > worst:
-                    worst, culprit = diff, f"{key[0]}[{key[1]}].{name}"
+                    worst, culprit = diff, f"{key[1]}[{key[2]}].{name}"
 
     lg, rg = left.grad_summary.get(step), right.grad_summary.get(step)
     if lg and rg:
@@ -411,7 +443,14 @@ def main(argv=None) -> int:
 
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps(vars(report), indent=2, sort_keys=True))
+            args.json.write_text(
+                json.dumps(
+                    _json_safe(vars(report)),
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
 
         return 1 if report.actionable else 0
 

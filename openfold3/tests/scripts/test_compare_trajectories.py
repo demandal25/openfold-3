@@ -348,9 +348,59 @@ def test_non_finite_is_not_zero_divergence_in_the_json(tmp_path, arms):
     blown = write_trajectory(tmp_path / "b.jsonl", seed=3, nonfinite_at=57)
     out = tmp_path / "r.json"
     assert _run((arms["cross_a"], blown), extra=["--json", str(out)]) == 1
-    report = json.loads(out.read_text())
-    assert report["max_divergence"] == float("inf")
+    text = out.read_text()
+
+    # Strict readers (Go, serde, most JS) reject the bare Infinity token that
+    # json.dumps emits for float("inf"), and Python's loads accepts it -- so
+    # assert strictness explicitly rather than relying on the default parser.
+    def _reject(token):
+        raise AssertionError(f"non-JSON constant in report: {token}")
+
+    report = json.JSONDecoder(parse_constant=_reject).decode(text)
+
+    assert report["max_divergence"] is None
+    assert report["kind"] == "nonfinite"
+    assert report["actionable"] is True
     assert report["first_divergent_step"] == 57
+
+
+def _write_accumulated(path: Path, *, micro_batches: int = 2) -> Path:
+    """A trajectory whose steps each hold several micro-batches."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for step in range(8):
+            for batch_idx in range(micro_batches):
+                for kind, extra in (
+                    ("batch", {"ids": [f"s{step}m{batch_idx}"]}),
+                    ("grad_summary", {"total_norm": 1.0 + batch_idx, "absmax": 1.0}),
+                ):
+                    handle.write(
+                        json.dumps(
+                            {"kind": kind, "step": step, "batch_idx": batch_idx, **extra},
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+    return path
+
+
+def test_gradient_accumulation_is_refused_not_silently_collapsed(tmp_path, capsys):
+    """Keying one record per step would drop every micro-batch but the last.
+
+    A divergence confined to micro-batch 0 would then read as IDENTICAL, which
+    is the worst answer this tool can give.
+    """
+    a = _write_accumulated(tmp_path / "a.jsonl")
+    b = _write_accumulated(tmp_path / "b.jsonl")
+    assert _run((a, b)) == 2
+    assert "gradient accumulation" in capsys.readouterr().err
+
+
+def test_single_micro_batch_per_step_is_accepted(tmp_path):
+    """The guard must not reject the pinned accumulate_grad_batches=1 config."""
+    a = _write_accumulated(tmp_path / "a.jsonl", micro_batches=1)
+    b = _write_accumulated(tmp_path / "b.jsonl", micro_batches=1)
+    assert _run((a, b)) == 0
 
 
 def test_unequal_arm_lengths_are_flagged(tmp_path, arms, capsys):

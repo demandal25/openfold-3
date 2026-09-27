@@ -134,6 +134,7 @@ class ParityProbeCallback(pl.Callback):
         self._batch_idx = 0
         self._probing = False
         self._warned_no_grads = False
+        self._warned_no_ids = False
         #: True only between on_train_batch_start and on_train_batch_end;
         #: otherwise validation forwards land on the preceding training step.
         self._in_train_batch = False
@@ -157,12 +158,34 @@ class ParityProbeCallback(pl.Callback):
         logger.info(
             "ParityProbe: %d modules matched, writing %s", len(self._handles), path
         )
+        # Per pattern, not just in aggregate: one dead pattern among five
+        # silently drops a whole stack from both arms.
+        patterns = [p.pattern for p in self.patterns]
+        counts = check_patterns_match(pl_module, patterns)
+        for pattern, count in counts.items():
+            if not count:
+                logger.warning(
+                    "ParityProbe: pattern %r matched no module; that stack will "
+                    "be absent from the trajectory",
+                    pattern,
+                )
         if not self._handles:
             logger.warning(
                 "ParityProbe: no module matched %s; only gradients and losses "
                 "will be recorded",
-                [p.pattern for p in self.patterns],
+                patterns,
             )
+        # Header row: two arms capped differently would otherwise compare on
+        # the intersection with nothing recording why.
+        self._emit(
+            kind="probe_config",
+            step=-1,
+            every_n_steps=self.every_n_steps,
+            max_firings_per_module=self.max_firings_per_module,
+            abort_on_nonfinite=self.abort_on_nonfinite,
+            patterns=patterns,
+            module_counts=counts,
+        )
 
     def teardown(self, trainer, pl_module, stage=None):
         for handle in self._handles:
@@ -208,19 +231,22 @@ class ParityProbeCallback(pl.Callback):
         def hook(_module, _inputs, output):
             if not (self._probing and self._in_train_batch):
                 return
+            # Counted before any filtering: firings is what classify() uses to
+            # spot an execution desync, so it must not skip odd outputs.
+            ordinal = self._ordinals[name]
+            self._ordinals[name] = ordinal + 1
+            # Beyond the cap the module is still counted but not recorded: the
+            # diffusion transformer fires ~842x per step under rollout, and the
+            # onset of a divergence is in the first few, not the last. Checked
+            # before _stats, which costs a host sync.
+            capped = self.max_firings_per_module
+            if capped and ordinal >= capped:
+                return
             tensor = output[0] if isinstance(output, tuple) else output
             if not isinstance(tensor, torch.Tensor):
                 return
             stats = _stats(tensor)
             if stats is None:
-                return
-            ordinal = self._ordinals[name]
-            self._ordinals[name] = ordinal + 1
-            # Beyond the cap the module is still counted but not recorded: the
-            # diffusion transformer fires ~842x per step under rollout, and the
-            # onset of a divergence is in the first few, not the last.
-            capped = self.max_firings_per_module
-            if capped and ordinal >= capped:
                 return
             self._emit(
                 kind="activation",
@@ -249,6 +275,13 @@ class ParityProbeCallback(pl.Callback):
         ids = batch.get("pdb_id") if isinstance(batch, dict) else None
         if ids is not None:
             self._emit(kind="batch", step=self._step, ids=[str(i) for i in ids])
+        elif not self._warned_no_ids:
+            self._warned_no_ids = True
+            logger.warning(
+                "ParityProbe: the batch carries no pdb_id, so sample identity "
+                "cannot be recorded and a data desync would be reported as a "
+                "numeric difference. Use a dataset that provides it."
+            )
 
     def on_before_backward(self, trainer, pl_module, loss):
         # Fires once per sample: OF3 calls manual_backward inside its own loop.

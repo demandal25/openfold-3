@@ -36,8 +36,9 @@ usage: run_arm.sh --runner-yaml FILE --output-dir DIR --seed N [options]
   --allow-dirty        proceed with uncommitted changes (records the fact)
   --dry-run            write provenance and print the command, do not launch
 
-Pins applied and recorded: vendor-independent RNG, deterministic algorithms,
-TF32 off, BLAS backend, autotune off, PYTHONHASHSEED.
+Pins applied and recorded: vendor-independent RNG, PYTHONHASHSEED, cuBLAS
+workspace, MIOpen find mode, inductor threads. Asserted from the yaml:
+deterministic algorithms, precision, probe on, vendor kernels off.
 USAGE
     exit 2
 }
@@ -61,6 +62,9 @@ done
 
 [[ -n "$RUNNER_YAML" && -n "$OUTPUT_DIR" && -n "$SEED" ]] || usage
 [[ -f "$RUNNER_YAML" ]] || { echo "no such runner yaml: $RUNNER_YAML" >&2; exit 2; }
+# Absolute before the cd to REPO_ROOT below, or a relative path resolves against
+# the wrong directory for every consumer after it.
+RUNNER_YAML="$(cd "$(dirname "$RUNNER_YAML")" && pwd)/$(basename "$RUNNER_YAML")"
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "--seed must be an integer" >&2; exit 2; }
 
 command -v run_openfold >/dev/null || {
@@ -174,7 +178,8 @@ record = {
     "env": {k: os.environ.get(k) for k in (
         "OF3_VENDOR_INDEPENDENT_RNG", "OF3_BLAS_LIBRARY", "PYTHONHASHSEED",
         "CUBLAS_WORKSPACE_CONFIG",
-        "MIOPEN_FIND_MODE", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+        "MIOPEN_FIND_MODE", "TORCHINDUCTOR_COMPILE_THREADS",
+        "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
         "TORCH_ROCM_FA_PREFER_CK", "OF3_TRITON_EXP2", "OF3_TRITON_DYNAMIC_SHAPES",
         "NCCL_ALGO", "NCCL_PROTO", "RCCL_ALGO",
     )},
@@ -252,12 +257,26 @@ if probe.get("enabled") is not True:
         "trajectory and could not be compared"
     )
 
+# Absence is not "off": the base model config turns some of these on by
+# default, so each has to be pinned False in the yaml to be pinned at all.
+VENDOR_KERNEL_FLAGS = (
+    "use_deepspeed_evo_attention",
+    "use_cueq_triangle_kernels",
+    "use_triton_triangle_kernels",
+    "use_lma",
+)
 memory = (settings or {}).get("memory", {}) or {}
 for phase in ("train", "eval"):
     flags = memory.get(phase, {}) or {}
     on = [k for k, v in flags.items() if k.startswith("use_") and v]
     if on:
         failures.append(f"settings.memory.{phase} leaves kernel flags on: {on}")
+    missing = [k for k in VENDOR_KERNEL_FLAGS if k not in flags]
+    if missing:
+        failures.append(
+            f"settings.memory.{phase} does not pin {missing}; the base config "
+            f"default would apply and it is vendor-dependent"
+        )
 
 if failures:
     print("refusing to launch; the arm would not be comparable:", file=sys.stderr)
